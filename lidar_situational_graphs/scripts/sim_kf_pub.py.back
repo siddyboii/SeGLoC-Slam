@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+sim_kf_publisher.py
+
+Simple test node that:
+ - Subscribes to /odom (nav_msgs/Odometry) to get pose for keyframes
+ - Subscribes to /room_segmentation/room_data (situational_graphs_msgs/RoomsData)
+ - When a RoomData message arrives, publishes synthetic KeyframeSemantic messages
+   using the most recent odom pose (or falling back to room cluster_center/room_center).
+
+Usage:
+  # after building messages and sourcing
+  ros2 run <your_package> sim_kf_publisher
+  # or
+  python3 tools/sim_kf_publisher.py
+
+Tune via params below or edit code.
+"""
+import rclpy
+from rclpy.node import Node
+import time
+from threading import Thread, Lock
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
+try:
+    from situational_graphs_msgs.msg import RoomsData, RoomData
+except Exception:
+    RoomsData = None
+try:
+    from lidar_situational_graphs.msg import KeyframeSemantic
+except Exception:
+    KeyframeSemantic = None
+
+# Simple deterministic object-mapping used for the test:
+def objects_for_room(room_id:int):
+    # change to your preferred mapping or make it more complex
+    if room_id % 2 == 0:
+        return ['bed', 'pillow'], [0.95, 0.85]
+    else:
+        return ['stove', 'fridge'], [0.92, 0.88]
+
+class SimKFPublisher(Node):
+    def __init__(self):
+        super().__init__('sim_kf_publisher')
+        # params (tune here or make them ROS params)
+        self.kfs_per_room = 3                # how many kfs to publish per room arrival
+        self.delay_between_kfs = 0.4         # seconds between keyframe publishes
+        self.room_cooldown_s = 15.0          # don't republish for same room for this many seconds
+        self.start_kf_id = 1000              # initial keyframe id for synthetic kfs
+
+        # internal state
+        self.last_odom_pose = None           # (x,y,z,quat) tuple or None
+        self.odom_lock = Lock()
+        self.kf_id_counter = self.start_kf_id
+        self.last_published_time_for_room = {}  # room_id -> timestamp
+
+        # publishers & subscribers
+        if KeyframeSemantic is None:
+            self.get_logger().error("KeyframeSemantic msg not importable. Make sure your messages are built and installed.")
+        else:
+            self.kf_pub = self.create_publisher(KeyframeSemantic, 'keyframe_semantics', 10)
+
+        # odom subscriber
+        self.odom_sub = self.create_subscription(Odometry, '/platform/odometry', self.cb_odom, 20)
+
+        # room data subscriber
+        if RoomsData is None:
+            self.get_logger().error("RoomsData msg not importable. Ensure situational_graphs_msgs is installed.")
+        else:
+            self.room_sub = self.create_subscription(RoomsData, '/room_segmentation/room_data_assigned', self.cb_rooms, 10)
+
+        self.get_logger().info("SimKFPublisher started. Waiting for room messages...")
+
+    def cb_odom(self, msg: Odometry):
+        # capture position and orientation for use as PoseStamped
+        with self.odom_lock:
+            p = msg.pose.pose
+            self.last_odom_pose = (float(p.position.x), float(p.position.y), float(p.position.z),
+                                   float(p.orientation.x), float(p.orientation.y), float(p.orientation.z), float(p.orientation.w))
+        # optional: log occasionally
+        # self.get_logger().debug(f"Updated odom pose: {self.last_odom_pose}")
+
+    def cb_rooms(self, msg):
+        # Called whenever a RoomsData message arrives; we publish synthetic keyframes for each room.
+        try:
+            rooms = msg.rooms
+        except Exception:
+            rooms = [msg]
+
+        for r in rooms:
+            rid = int(getattr(r, 'id', getattr(r, 'room_id', -1)))
+            if rid < 0:
+                continue
+            now = self.get_clock().now().nanoseconds / 1e9
+            last_t = self.last_published_time_for_room.get(rid, 0.0)
+            if now - last_t < self.room_cooldown_s:
+                self.get_logger().info(f"Room {rid} ignored due cooldown ({now - last_t:.1f}s < {self.room_cooldown_s}s)")
+                continue
+
+            # Determine a fallback pose if odom isn't available (cluster_center or room_center)
+            fallback_pose = None
+            # try cluster_center
+            if hasattr(r, 'cluster_center') and getattr(r, 'cluster_center', None) is not None:
+                try:
+                    cc = r.cluster_center
+                    fallback_pose = (float(cc.x), float(cc.y), 0.0, 0.0, 0.0, 0.0, 1.0)
+                except Exception:
+                    fallback_pose = None
+            # try room_center.pose.position
+            if fallback_pose is None and hasattr(r, 'room_center') and getattr(r, 'room_center', None) is not None:
+                try:
+                    rc = r.room_center.position
+                    fallback_pose = (float(rc.x), float(rc.y), float(rc.z), 0.0, 0.0, 0.0, 1.0)
+                except Exception:
+                    fallback_pose = None
+
+            # choose objects + confidences for this room (deterministic mapping)
+            objs, confs = objects_for_room(rid)
+            floor = int(getattr(r, 'floor_id', 0))
+            rid = -1
+
+            # spawn a thread to publish the sequence so we don't block the callback for long
+            t = Thread(target=self.publish_kfs_for_room, args=(rid, floor, objs, confs, fallback_pose))
+            t.daemon = True
+            t.start()
+
+            # update cooldown timestamp
+            self.last_published_time_for_room[rid] = now
+
+    def publish_kfs_for_room(self, room_id, floor_id, objects, confs, fallback_pose):
+        # publish kfs_per_room messages spaced by delay_between_kfs
+        for i in range(self.kfs_per_room):
+            kf_id = self.next_kf_id()
+            msg = KeyframeSemantic()
+            # header
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'map'  # keep 'map' or set appropriately
+            #msg.keyframe_id = int(kf_id)
+            #msg.keyframe_seq = int(kf_id)
+            # timings & ids
+            msg.stamp = self.get_clock().now().to_msg()
+            #msg.floor_id = int(floor_id)
+            #msg.room_id = int(room_id)
+            msg.objects = list(objects)
+            msg.object_confidence = list(confs)
+            msg.scene_confidence = float(sum(confs) / max(len(confs), 1))
+            msg.model_name = 'sim_kf_publisher_v1'
+
+            # pose: use most recent odom if available else fallback
+            pose_stamped = PoseStamped()
+            pose_stamped.header.stamp = self.get_clock().now().to_msg()
+            pose_stamped.header.frame_id = 'map'
+            with self.odom_lock:
+                od = self.last_odom_pose
+            if od is not None:
+                pose_stamped.pose.position.x = float(od[0])
+                pose_stamped.pose.position.y = float(od[1])
+                pose_stamped.pose.position.z = float(od[2])
+                pose_stamped.pose.orientation.x = float(od[3])
+                pose_stamped.pose.orientation.y = float(od[4])
+                pose_stamped.pose.orientation.z = float(od[5])
+                pose_stamped.pose.orientation.w = float(od[6])
+            else:
+                if fallback_pose is not None:
+                    pose_stamped.pose.position.x = float(fallback_pose[0])
+                    pose_stamped.pose.position.y = float(fallback_pose[1])
+                    pose_stamped.pose.position.z = float(fallback_pose[2])
+                    pose_stamped.pose.orientation.x = float(fallback_pose[3])
+                    pose_stamped.pose.orientation.y = float(fallback_pose[4])
+                    pose_stamped.pose.orientation.z = float(fallback_pose[5])
+                    pose_stamped.pose.orientation.w = float(fallback_pose[6])
+                else:
+                    # if nothing else, zero pose
+                    pose_stamped.pose.position.x = 0.0
+                    pose_stamped.pose.position.y = 0.0
+                    pose_stamped.pose.position.z = 0.0
+                    pose_stamped.pose.orientation.w = 1.0
+
+            # set the PoseStamped into KeyframeSemantic (field name 'pose' we added)
+            try:
+                msg.pose = pose_stamped
+            except Exception:
+                # If your generated message used a different field name or type, adapt here
+                pass
+
+            # publish
+            try:
+                self.kf_pub.publish(msg)
+                self.get_logger().info(f"Published synthetic KeyframeSemantic kf={kf_id} for room={room_id} objects={objects}")
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish KeyframeSemantic: {e}")
+
+            # small delay between keyframes
+            time.sleep(self.delay_between_kfs)
+
+    def next_kf_id(self):
+        # simple incrementing id
+        self.kf_id_counter += 1
+        return self.kf_id_counter
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SimKFPublisher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+

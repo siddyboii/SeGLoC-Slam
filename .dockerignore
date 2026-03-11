@@ -1,0 +1,26 @@
+# Exclude build artifacts that cause duplicate package errors
+build/
+install/
+log/
+code_zone/
+
+# Exclude large unnecessary directories
+bags/
+gt/
+IQM_Python/
+models/
+test_codes/
+documentation/
+final_architecture/
+basement_map/
+
+# Docker contexts
+docker/
+
+# Git
+.git/
+
+# IDE
+.vscode/
+*.pyc
+__pycache__/

@@ -1,0 +1,18 @@
+# ROS build folders
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model files
+*.onnx
+*.trt
+
+# Data
+/bags/
+/documentation/
+/final_architecture/
+/code_zone/

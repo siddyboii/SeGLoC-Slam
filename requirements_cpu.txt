@@ -1,0 +1,13 @@
+# CPU-only Python requirements (no CUDA dependency)
+networkx==2.8.7
+numpy==1.23.4
+matplotlib>=3.3.1
+tensorboard==2.14.0
+colorama==0.4.6
+shapely==2.0.4
+markupsafe==2.1.5
+seaborn==0.13.2
+numexpr==2.8.4
+bottleneck==1.3.6
+onnxruntime>=1.18.0
+opencv-python-headless
