@@ -52,7 +52,7 @@ private:
     float pad_y_;
     float scale_;
 
-    std::vector<std::string> class_names_ {"Persons", "Windows", "Lights", "Door", " "};
+    std::vector<std::string> class_names_ {"Door", "Cupboard", "Desk", "Monitor", "Chair", "Wire", "Pillar", "Tree", "Table", " "};
 
 public:
     explicit YOLOOnnxDetector(const std::string& onnx_model_path);

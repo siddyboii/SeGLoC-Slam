@@ -129,6 +129,22 @@ SGraphsNode::SGraphsNode() : Node("s_graphs_node") {
 
   always_publish_map =
       this->get_parameter("always_publish_map").get_parameter_value().get<bool>();
+  
+  // Semantic processing parameters
+  yolo_model_path_ = this->get_parameter("yolo_model_path").get_parameter_value().get<std::string>();
+  clip_model_path_ = this->get_parameter("clip_model_path").get_parameter_value().get<std::string>();
+  confidence_threshold_ = this->get_parameter("confidence_threshold").get_parameter_value().get<double>();
+  process_every_n_frames_ = this->get_parameter("process_every_n_frames").get_parameter_value().get<int>();
+  enable_yolo_ = this->get_parameter("enable_yolo").get_parameter_value().get<bool>();
+  enable_clip_ = this->get_parameter("enable_clip").get_parameter_value().get<bool>();
+  publish_semantics_with_graph_ = this->get_parameter("publish_semantics_with_graph").get_parameter_value().get<bool>();
+  visualize_detections_ = this->get_parameter("visualize_detections").get_parameter_value().get<bool>();
+  use_camera_inference_ = this->get_parameter("use_camera_inference").get_parameter_value().get<bool>();
+  camera_topic_ = this->get_parameter("camera_topic").get_parameter_value().get<std::string>();
+  RCLCPP_INFO_STREAM(this->get_logger(), "Camera topic is:" << camera_topic_);
+  RCLCPP_INFO_STREAM(this->get_logger(), "yolo model path:" << yolo_model_path_);
+  RCLCPP_INFO_STREAM(this->get_logger(), "enable clip is:" << enable_clip_);
+  RCLCPP_INFO_STREAM(this->get_logger(), "use_camera_inference is:" << use_camera_inference_);
 
   // tfs
   tf_buffer = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -157,17 +173,25 @@ SGraphsNode::SGraphsNode() : Node("s_graphs_node") {
 
   odom_sub.subscribe(this, "odom");
   cloud_sub.subscribe(this, "filtered_points");
+
+  RCLCPP_WARN_STREAM(this->get_logger(), "USING CAMERA INFERENCE" << use_camera_inference_ << "CAMERA TOPIC" << camera_topic_);
+
+  if(use_camera_inference_){
+    // CAMERA INTEGRATION COMMENTED OUT - Reverting to original dual sync
+    image_sub.subscribe(this, camera_topic_);
+    RCLCPP_WARN(this->get_logger(), "USING CAMERA LOGIC");
+    sync.reset(new message_filters::Synchronizer<TripleSyncPolicy>(
+        TripleSyncPolicy(odom_pc_sync_queue), odom_sub, cloud_sub, image_sub));
+    sync->registerCallback(&SGraphsNode::cloud_image_odom_callback, this);
+  }
+  else{
+    // Original dual synchronizer (odom + pointcloud)
+    RCLCPP_WARN(this->get_logger(), "USING ORIGINAL LOGIC");
+    synca.reset(new message_filters::Synchronizer<ApproxSyncPolicy>(
+        ApproxSyncPolicy(odom_pc_sync_queue), odom_sub, cloud_sub));
+    synca->registerCallback(&SGraphsNode::cloud_callback, this);
+  }
   
-  // CAMERA INTEGRATION COMMENTED OUT - Reverting to original dual sync
-  image_sub.subscribe(this, "/alphasense/cam0/image_raw");
-  sync.reset(new message_filters::Synchronizer<TripleSyncPolicy>(
-      TripleSyncPolicy(odom_pc_sync_queue), odom_sub, cloud_sub, image_sub));
-  sync->registerCallback(&SGraphsNode::cloud_image_odom_callback, this);
-  
-  // Original dual synchronizer (odom + pointcloud)
-  // sync.reset(new message_filters::Synchronizer<ApproxSyncPolicy>(
-  //     ApproxSyncPolicy(odom_pc_sync_queue), odom_sub, cloud_sub));
-  // sync->registerCallback(&SGraphsNode::cloud_callback, this);
 
   raw_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
       "odom",
@@ -308,15 +332,7 @@ SGraphsNode::SGraphsNode() : Node("s_graphs_node") {
     ongoing_optimization_class = optimization_class::LOCAL_GLOBAL;
   }
 
-  // Semantic processing parameters
-  yolo_model_path_ = this->get_parameter("yolo_model_path").get_parameter_value().get<std::string>();
-  clip_model_path_ = this->get_parameter("clip_model_path").get_parameter_value().get<std::string>();
-  confidence_threshold_ = this->get_parameter("confidence_threshold").get_parameter_value().get<double>();
-  process_every_n_frames_ = this->get_parameter("process_every_n_frames").get_parameter_value().get<int>();
-  enable_yolo_ = this->get_parameter("enable_yolo").get_parameter_value().get<bool>();
-  enable_clip_ = this->get_parameter("enable_clip").get_parameter_value().get<bool>();
-  publish_semantics_with_graph_ = this->get_parameter("publish_semantics_with_graph").get_parameter_value().get<bool>();
-  visualize_detections_ = this->get_parameter("visualize_detections").get_parameter_value().get<bool>();
+  
 
   static_tf_timer =
       this->create_wall_timer(std::chrono::seconds(1),
@@ -465,6 +481,8 @@ void SGraphsNode::declare_ros_params() {
   this->declare_parameter("enable_clip", true);
   this->declare_parameter("visualize_detections", true);
   this->declare_parameter("publish_semantics_with_graph", true);
+  this->declare_parameter("use_camera_inference", true);
+  this->declare_parameter("camera_topic", "");
 
   // Zone-based prefiltering parameters
   this->declare_parameter("use_zone_prefilter", true);
@@ -604,7 +622,7 @@ void SGraphsNode::init_map2odom_pose_callback(
   }
 }
 
-/*void SGraphsNode::cloud_callback(
+void SGraphsNode::cloud_callback(
     const nav_msgs::msg::Odometry::SharedPtr odom_msg,
     const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
   
@@ -740,7 +758,7 @@ void SGraphsNode::init_map2odom_pose_callback(
   RCLCPP_INFO(this->get_logger(), 
               "[S_GRAPHS DEBUG] ========== cloud_callback FINISHED ==========\n");
 }
-*/
+
 // CAMERA INTEGRATION COMMENTED OUT - This callback was for triple sync (odom + pointcloud + image)
 // Will be re-enabled later for semantic integration
 
@@ -854,6 +872,7 @@ void SGraphsNode::room_data_callback(
     const situational_graphs_msgs::msg::RoomsData::SharedPtr rooms_msg) {
   std::lock_guard<std::mutex> lock(room_data_queue_mutex);
   room_data_queue.push_back(*rooms_msg);
+  RCLCPP_ERROR(this->get_logger(), "---------Room data queue is filled and is of size ---------%ld", room_data_queue.size());
 }
 
 void SGraphsNode::floor_data_callback(
@@ -1029,11 +1048,13 @@ bool SGraphsNode::flush_keyframe_queue() {
 
 void SGraphsNode::flush_room_data_queue() {
   if (keyframes.empty() || floors_vec.empty()) {
+    std::cout << "-----------------------------------keyframe or floor_vec is empty----------------------------------------" << std::endl;
     return;
   } else if (room_data_queue.empty()) {
-    // std::cout << "room data queue is empty" << std::endl;
+    std::cout << "-----------------------------------room data queue is empty----------------------------------------" << std::endl;
     return;
   }
+  RCLCPP_WARN(this->get_logger(), "================KUCH TO CHAL JAA===========================");
 
   // update room height based on current_floor level
   for (auto& room_data_msg : room_data_queue) {
@@ -1044,16 +1065,20 @@ void SGraphsNode::flush_room_data_queue() {
       graph_mutex.unlock();
     }
   }
+  RCLCPP_WARN(this->get_logger(), "KAAM CHALU HAII");
 
   std::deque<std::pair<VerticalPlanes, VerticalPlanes>> dupl_x_vert_planes,
       dupl_y_vert_planes;
   for (const auto& room_data_msg : room_data_queue) {
     for (const auto& room_data : room_data_msg.rooms) {
+      RCLCPP_WARN(this->get_logger(), "SIZE OF X_PLANES IN ROOM DATA QUEUE %ld and SIZE OF Y_PLANES IN ROOM DATA QUEUE %ld", room_data.x_planes.size(), room_data.y_planes.size());
       if (room_data.x_planes.size() == 2 && room_data.y_planes.size() == 2) {
         float x_width = PlaneUtils::width_between_planes(room_data.x_planes[0],
                                                          room_data.x_planes[1]);
         float y_width = PlaneUtils::width_between_planes(room_data.y_planes[0],
                                                          room_data.y_planes[1]);
+        
+        RCLCPP_WARN(this->get_logger(), "WIDTH BW TWO X PLANES %.3f and WIDTH BW TWO Y PLANES %.3f", x_width, y_width);
 
         if (fabs(x_width) < 0.5 || fabs(y_width) < 0.5) continue;
 
@@ -1083,6 +1108,7 @@ void SGraphsNode::flush_room_data_queue() {
       else if (room_data.x_planes.size() == 2 && room_data.y_planes.size() == 0) {
         float x_width = PlaneUtils::width_between_planes(room_data.x_planes[0],
                                                          room_data.x_planes[1]);
+        RCLCPP_WARN_STREAM(this->get_logger(),"WIDTH BW TWO X INFINITE PLANES " << x_width);
         if (fabs(x_width) < 0.5) continue;
 
         int current_room_id;
@@ -1108,6 +1134,7 @@ void SGraphsNode::flush_room_data_queue() {
       else if (room_data.x_planes.size() == 0 && room_data.y_planes.size() == 2) {
         float y_width = PlaneUtils::width_between_planes(room_data.y_planes[0],
                                                          room_data.y_planes[1]);
+        RCLCPP_WARN_STREAM(this->get_logger(),"WIDTH BW TWO Y INFINITE PLANES " << y_width);                                             
         if (fabs(y_width) < 0.5) continue;
 
         int current_room_id;
@@ -1132,6 +1159,7 @@ void SGraphsNode::flush_room_data_queue() {
 
     room_data_queue_mutex.lock();
     room_data_queue.pop_front();
+    RCLCPP_ERROR(this->get_logger(), "_______________________ KHEL KHATAM SIZE LEFT __________  %ld",room_data_queue.size()); 
     room_data_queue_mutex.unlock();
   }
 

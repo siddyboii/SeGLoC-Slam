@@ -161,5 +161,4 @@
     confidence_threshold: 0.25
     process_every_n_frames: 5
     enable_yolo: true
-    enable_clip: true
-    visualize_detections: true
+    enable_clip: false

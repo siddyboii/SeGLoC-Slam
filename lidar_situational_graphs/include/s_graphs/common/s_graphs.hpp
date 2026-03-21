@@ -618,10 +618,10 @@ class SGraphsNode : public rclcpp::Node {
   // sycnconisers updates - REVERTED TO DUAL SYNC (odom + pointcloud only)
 
   // Original dual sync policy (odom + pointcloud)
-//   typedef message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry,
-//                                                           sensor_msgs::msg::PointCloud2>
-//       ApproxSyncPolicy;
-//   std::shared_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> sync;
+  typedef message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry,
+                                                          sensor_msgs::msg::PointCloud2>
+      ApproxSyncPolicy;
+  std::shared_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> synca;
   
 //   Triple sync policy COMMENTED OUT - for future camera integration
   typedef message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry,
@@ -808,6 +808,8 @@ class SGraphsNode : public rclcpp::Node {
   bool enable_clip_;
   bool visualize_detections_;
   bool publish_semantics_with_graph_;
+  bool use_camera_inference_;
+  std::string camera_topic_;
   
   // Semantic state
   long frame_count_ = 0;

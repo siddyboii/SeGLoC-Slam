@@ -118,6 +118,16 @@ def generate_launch_description():
                 default_value="true",
                 description="Enable DynaTrack (optical flow dynamic object detection)",
             ),
+            DeclareLaunchArgument(
+                "use_camera_inference",
+                default_value="true",
+                description="To use Camera data for SLAM",
+            ),
+            DeclareLaunchArgument(
+                "camera_topic",
+                default_value="/alphasense/cam0/image_raw",
+                description="Topic name for camera",
+            ),
             OpaqueFunction(function=launch_sgraphs),
         ]
     )
@@ -179,6 +189,10 @@ def launch_sgraphs(context, *args, **kwargs):
         "yolo_model_path").perform(context)
     clip_model_path_arg = LaunchConfiguration(
         "clip_model_path").perform(context)
+    use_camera_inference_arg = LaunchConfiguration(
+        "use_camera_inference").perform(context)
+    camera_topic_arg = LaunchConfiguration(
+        "camera_topic").perform(context)
 
     ns_prefix = str(namespace_arg) + "/" if namespace_arg else ""
     if str(ns_prefix).startswith("/"):
@@ -257,6 +271,8 @@ def launch_sgraphs(context, *args, **kwargs):
                 "process_every_n_frames": process_every_n_frames_arg,
                 "yolo_model_path": yolo_model_path_arg,
                 "clip_model_path": clip_model_path_arg,
+                "use_camera_inference": use_camera_inference_arg == "true",
+                "camera_topic": camera_topic_arg,
             },
         ],
         output={

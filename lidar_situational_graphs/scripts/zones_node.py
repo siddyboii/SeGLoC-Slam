@@ -15,10 +15,13 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from collections import defaultdict, deque
 from shapely.geometry import Polygon as ShapelyPolygon, Point as ShapelyPoint
 from shapely.ops import unary_union
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 import numpy as np
 import time
 import math
 import traceback
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
 
 # Message imports (robust)
 RoomsData = None
@@ -135,43 +138,131 @@ def ros_time_to_sec(rostime):
     except Exception:
         return 0.0
 
+# def polygon_from_planes(planes):
+#     """
+#     Build convex hull polygon from centroids of plane_points inside the plane structures.
+#     Supports planes list that may come from x_planes or y_planes entries.
+#     """
+#     pts = []
+#     for p in planes:
+#         points = None
+#         # plane_points is used in your room data
+#         if hasattr(p, 'plane_points') and getattr(p, 'plane_points', None):
+#             print("appending the plane points from field plane_points")
+#             points = p.plane_points
+#         elif hasattr(p, 'points') and getattr(p, 'points', None):
+#             points = p.points
+#         else:
+#             # some plane types might store a 'plane_center' directly
+#             if hasattr(p, 'plane_center') and p.plane_center is not None:
+#                 try:
+#                     pts.append((float(p.plane_center.x), float(p.plane_center.y)))
+#                 except Exception:
+#                     pass
+#                 continue
+#         if not points:
+#             continue
+#         sx = 0.0; sy = 0.0; n = 0
+#         for q in points:
+#             try:
+#                 print("Calculating sx sy and n")
+#                 sx += float(q.x); sy += float(q.y); n += 1
+#                 print("sx sy n",sx, sy, n)
+#             except Exception:
+#                 continue
+#         if n == 0:
+#             continue
+#         pts.append((sx / n, sy / n))
+#     print("Length of the appended points",len(pts))
+#     # if len(pts) < 1:
+#     #     return None
+#     print("CHALOO")
+#     try:
+#         print("Kuch to hora hai shapely polygon se yaar ",ShapelyPolygon(pts).convex_hull)
+#         return ShapelyPolygon(pts).convex_hull
+#     except Exception:
+#         print("FIR SE HUI GALTI")
+#         return None
 def polygon_from_planes(planes):
     """
-    Build convex hull polygon from centroids of plane_points inside the plane structures.
-    Supports planes list that may come from x_planes or y_planes entries.
+    Build convex hull polygon from ALL plane_points (preferred).
+    - supports planes with .plane_points, .points or .plane_center
+    - returns a shapely geometry (Polygon / buffered LineString / buffered Point) or None
     """
+    from shapely.geometry import LineString  # local import so no top-level edit needed
+
     pts = []
-    for p in planes:
-        points = None
-        # plane_points is used in your room data
-        if hasattr(p, 'plane_points') and getattr(p, 'plane_points', None):
-            points = p.plane_points
-        elif hasattr(p, 'points') and getattr(p, 'points', None):
-            points = p.points
+    for i, p in enumerate(planes):
+        points = getattr(p, 'plane_points', None) or getattr(p, 'points', None)
+        if points:
+            # append all plane points projected to XY
+            for q in points:
+                try:
+                    x = float(q.x); y = float(q.y)
+                    # filter invalid numbers
+                    if math.isfinite(x) and math.isfinite(y):
+                        pts.append((x, y))
+                except Exception:
+                    continue
         else:
-            # some plane types might store a 'plane_center' directly
+            # fallback to plane_center if present
             if hasattr(p, 'plane_center') and p.plane_center is not None:
                 try:
-                    pts.append((float(p.plane_center.x), float(p.plane_center.y)))
+                    x = float(p.plane_center.x); y = float(p.plane_center.y)
+                    if math.isfinite(x) and math.isfinite(y):
+                        pts.append((x, y))
                 except Exception:
                     pass
-                continue
-        if not points:
+            # some message variants may expose plane_center as a geometry Pose/Point field
+            elif hasattr(p, 'plane_center') and getattr(p, 'plane_center', None):
+                try:
+                    pc = p.plane_center
+                    if hasattr(pc, 'position'):
+                        x = float(pc.position.x); y = float(pc.position.y)
+                        if math.isfinite(x) and math.isfinite(y):
+                            pts.append((x, y))
+                except Exception:
+                    pass
+
+    # remove duplicates while preserving order (round to reduce floating noise)
+    seen = set()
+    pts_unique = []
+    for x, y in pts:
+        key = (round(x, 4), round(y, 4))
+        if key in seen:
             continue
-        sx = 0.0; sy = 0.0; n = 0
-        for q in points:
-            try:
-                sx += float(q.x); sy += float(q.y); n += 1
-            except Exception:
-                continue
-        if n == 0:
-            continue
-        pts.append((sx / n, sy / n))
-    if len(pts) < 3:
+        seen.add(key)
+        pts_unique.append((x, y))
+
+    print("Length of the appended points", len(pts_unique))
+    if len(pts_unique) == 0:
         return None
+
+    # 1 point -> small buffered area
+    if len(pts_unique) == 1:
+        try:
+            return ShapelyPoint(pts_unique[0]).buffer(0.2).convex_hull
+        except Exception:
+            return None
+
+    # 2 points -> buffered line (use a small width appropriate for your environment)
+    if len(pts_unique) == 2:
+        try:
+            ls = LineString(pts_unique)
+            # buffer size: tune this (0.15-0.5 m typical). I pick 0.25m as conservative default.
+            return ls.buffer(0.25).convex_hull
+        except Exception:
+            return None
+
+    # 3+ points -> convex hull of all points
     try:
-        return ShapelyPolygon(pts).convex_hull
+        poly = ShapelyPolygon(pts_unique).convex_hull
+        if poly.is_empty:
+            return None
+        return poly
     except Exception:
+        # debug-friendly print (you can remove in production)
+        print("FIR SE HUI GALTI in polygon_from_planes:", traceback.format_exc())
         return None
 
 def objects_to_label_vec(objects, confs):
@@ -197,7 +288,7 @@ class ZonesNode(Node):
         # parameters
         self.declare_parameter('theta_merge', 0.65)
         self.declare_parameter('semantic_window_s', 30.0)
-        self.declare_parameter('min_kf_for_room', 2)
+        self.declare_parameter('min_kf_for_room', 1)
         self.declare_parameter('kf_association_radius_m', 2.0)
         self.declare_parameter('kf_association_time_s', 60.0)
         self.declare_parameter('adjacency_distance_m', 0.75)
@@ -242,20 +333,33 @@ class ZonesNode(Node):
         q = QoSProfile(depth=10)
         q.durability = DurabilityPolicy.TRANSIENT_LOCAL
         q.history = HistoryPolicy.KEEP_LAST
+
+        self.debug_pub = self.create_publisher(Marker, "shapely_debug", 10)
+
         self.zone_pub = None
         if Zone is not None:
             self.zone_pub = self.create_publisher(Zone, 'zones', q)
 
+        room_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
         # Subscriptions
         if RoomsData is not None:
-            self.room_sub = self.create_subscription(RoomsData, 'room_segmentation/room_data_assigned', self.cb_roomsdata, 10)
+            #self.room_sub = self.create_subscription(RoomsData, '/room_segmentation/room_data_assigned', self.cb_roomsdata, 10)
+            self.room_sub = self.create_subscription(RoomsData,'/room_segmentation/room_data_assigned',self.cb_roomsdata,room_qos)
             self.get_logger().info("Subscribed to room_segmentation/room_data_assigned")
         else:
             self.get_logger().warning('RoomsData msg not available. Please build situational_graphs_msgs.')
 
+
+
         if KeyframeSemantic is not None:
             self.kf_sem_sub = self.create_subscription(
-                KeyframeSemantic, 's_graphs/keyframe_semantic', self.cb_kf_sem, 200)
+                KeyframeSemantic, '/s_graphs/keyframe_semantic', self.cb_kf_sem, 200)
             self.get_logger().info("Subscribed to s_graphs/keyframe_semantic")
         else:
             self.get_logger().warning('KeyframeSemantic msg not importable; ensure messages built and installed.')
@@ -272,6 +376,65 @@ class ZonesNode(Node):
 
         self.get_logger().info("Zones Node initialized (caches ready)")
 
+
+    def visualize_point(self, pt, marker_id=0):
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+
+        marker.ns = "shapely_points"
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = float(pt.x)
+        marker.pose.position.y = float(pt.y)
+        marker.pose.position.z = 0.1
+
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+
+        self.debug_pub.publish(marker)
+
+    def visualize_polygon(self, poly, marker_id=100):
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+
+        marker.ns = "shapely_polygon"
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.05
+
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        print(poly.exterior.coords)
+
+        for x, y in poly.exterior.coords:
+            p = Point()
+            p.x = float(x)
+            p.y = float(y)
+            p.z = 0.05
+            marker.points.append(p)
+
+        self.debug_pub.publish(marker)
+
     # --------------------------
     # Semantic callback (now supports keyframe_id fast-path)
     # --------------------------
@@ -286,6 +449,7 @@ class ZonesNode(Node):
          - else: append to semantic_cache for later matching
         """
         try:
+            print("===========ENTERED KF CALLBACK===============")
             # stamp from header preferred, fallback to msg.stamp or now
             try:
                 stamp = ros_time_to_sec(msg.header.stamp)
@@ -301,6 +465,7 @@ class ZonesNode(Node):
             # try to find a pose in semantic message: several possible fields depending on publisher
             pose_tuple = None
             if hasattr(msg, 'pose') and getattr(msg, 'pose', None) is not None:
+                print("-----------Found the pose---------")
                 try:
                     ps = msg.pose
                     if hasattr(ps, 'pose'):
@@ -308,6 +473,7 @@ class ZonesNode(Node):
                     else:
                         p = ps
                     pose_tuple = (float(p.position.x), float(p.position.y), float(p.position.z))
+                    print("----------Adding the pose----------")
                 except Exception:
                     pose_tuple = None
             if pose_tuple is None and hasattr(msg, 'odom') and getattr(msg, 'odom', None) is not None:
@@ -333,12 +499,17 @@ class ZonesNode(Node):
             # ----- FAST PATH: if message contains canonical keyframe id, attach directly -----
             kfid = getattr(msg, 'keyframe_id', None)
             if kfid is not None:
+                print("/////////FOUND KF ID IN MESSAGE////////////")
                 try:
                     kfid_int = int(kfid)
                 except Exception:
                     kfid_int = -1
+                print("KFID IS: ", kfid_int)
                 if kfid_int >= 0:
                     # Attach directly into kf_semantics (aggregate)
+                    print("______________Sending kf_id to aggregate the semantics__________________________")
+                    self.keyframe_poses[kfid_int] = {'pose': pose_tuple, 'stamp': sem_entry['stamp']}
+                    self.keyframe_time_index.append((sem_entry['stamp'], int(kfid)))
                     self._aggregate_semantic_to_kf(kfid_int, sem_entry)
                     # If the incoming semantic provided a pose but no keyframe pose exists yet, we keep it in kf_semantics
                     # so later room association will pick it up once graph keyframes arrive.
@@ -375,7 +546,8 @@ class ZonesNode(Node):
             else:
                 # buffer it for later association
                 self.semantic_cache.append((stamp, sem_entry))
-                self._prune_semantic_cache()
+                print(self.semantic_cache)
+                #self._prune_semantic_cache()
                 self.get_logger().debug("Semantic buffered (no keyframe match yet)")
 
         except Exception:
@@ -408,7 +580,9 @@ class ZonesNode(Node):
         self.kf_semantics[kfid] = ent
         # prune old semantics if needed
         # Need to add a check here somewhere if the pruning is working correct or not
-        self._prune_kf_semantics()
+        print("Aggregated the semantic now sending to pruneing")
+        print(self.kf_semantics)
+        #self._prune_kf_semantics()
 
     # --------------------------
     # Graph keyframes callback
@@ -458,7 +632,7 @@ class ZonesNode(Node):
                     continue
 
             # prune keyframe cache
-            self._prune_keyframe_cache()
+            #self._prune_keyframe_cache()
             # try to attach any buffered semantics that now fall within tolerance for these new keyframes
             self._attach_buffered_semantics_to_keyframes()
         except Exception:
@@ -496,13 +670,15 @@ class ZonesNode(Node):
                 # keep for future
                 remaining.append((stamp, sem))
         self.semantic_cache = remaining
-        self._prune_semantic_cache()
+        print(self.semantic_cache)
+        #self._prune_semantic_cache()
 
     # --------------------------
     # RoomsData callback
     # --------------------------
     def cb_roomsdata(self, msg):
         try:
+            print("!!!!!!!!!!!! ENTERED ROOM CALLBACK !!!!!!!!!!!!!!!!!!!!!!!!!!")
             # capture header stamp if present (used for time based matching)
             try:
                 self.last_room_stamp = ros_time_to_sec(msg.header.stamp)
@@ -510,12 +686,15 @@ class ZonesNode(Node):
                 self.last_room_stamp = 0.0
 
             try:
+                print("-------------------ROOM MILGAYA MITTAR---------------------")
                 rooms = msg.rooms
             except Exception:
                 rooms = [msg]
 
+            print("rooms kitne hai abhi? ", rooms.__sizeof__())
             for r in rooms:
                 rid = int(getattr(r, 'id', getattr(r, 'room_id', -1)))
+                print("Room ID is: ", rid)
                 if rid < 0:
                     continue
                 floor_id = int(getattr(r, 'floor_id', 0))
@@ -527,11 +706,13 @@ class ZonesNode(Node):
                 try:
                     xps = getattr(r, 'x_planes', [])
                     yps = getattr(r, 'y_planes', [])
+                    print("yps is", yps)
                 except Exception:
                     xps = []; yps = []
 
                 for p in list(xps) + list(yps):
                     planes_combined.append(p)
+                    print("planes combined is ",planes_combined)
                     if hasattr(p, 'id'):
                         try:
                             plane_ids.add(int(p.id))
@@ -539,7 +720,9 @@ class ZonesNode(Node):
                             pass
 
                 # build polygon from plane centroids
+                print(len(planes_combined))
                 poly = polygon_from_planes(planes_combined) if len(planes_combined) > 0 else None
+                print("made polygon from the planes from the message ", poly)
 
                 # cluster center
                 cluster_center = None
@@ -568,6 +751,7 @@ class ZonesNode(Node):
 
                 # associate keyframes
                 associated_kfs = self.associate_keyframes_to_room_direct(rid, floor_id, poly, cluster_center)
+                print("Associated the keyframes to room id now will try to create the zones", associated_kfs)
                 # store associated keyframes
                 for kf in associated_kfs:
                     try:
@@ -578,10 +762,13 @@ class ZonesNode(Node):
                 # compute room signature and decide zone merge/create
                 recent_kfs = [kf for kf in self.rooms[rid]['keyframes'] if kf in self.kf_semantics]
                 if len(recent_kfs) >= self.min_kf_for_room:
+                    print("Computing signature")
                     room_sig = self.compute_room_signature(recent_kfs)
                     self.rooms[rid]['room_sig'] = room_sig
+                    print("Trying to merge room into zone")
                     merged = self.try_merge_room_into_zone(rid, room_sig)
                     if not merged:
+                        print("Nahi hua merge afsos")
                         self.create_zone_from_room(rid, room_sig)
                 else:
                     self.get_logger().debug(f"Room {rid}: not enough KFs with semantics ({len(recent_kfs)}) to compute signature")
@@ -601,9 +788,11 @@ class ZonesNode(Node):
         """
         now = self.get_clock().now().nanoseconds / 1e9
         result = set()
+        print("Doing association do not disturb")
 
         # 1) direct mapping from semantics (if semantic entries had room_id)
         for kfid, ent in self.kf_semantics.items():
+            print("Something is wrong")
             if ent.get('room_id', -1) == rid:
                 if now - ent.get('stamp', 0.0) > self.kf_association_time_s:
                     continue
@@ -618,6 +807,7 @@ class ZonesNode(Node):
         if room_stamp and room_stamp > 1.0:
             tol = self.kf_time_tol_s
             for kf_stamp, kfid in reversed(self.keyframe_time_index):
+                print("Time based matching but with wrong topic", abs(kf_stamp - room_stamp))
                 if abs(kf_stamp - room_stamp) <= tol:
                     # check recency & floor if semantic info exists for this kf
                     sement = self.kf_semantics.get(int(kfid), None)
@@ -631,24 +821,39 @@ class ZonesNode(Node):
                 return list(result)
 
         # 3) polygon containment using kf poses
+        print("Do we have poly? ", poly)
         if poly is not None:
             # check semantics that have pose first
+            print("Pose matching on the bases of pose stored in room and semantic keyframe")
+            print("Lets see the size of kf semantics",self.kf_semantics)
             for kfid, sem in self.kf_semantics.items():
+                print("kf id is this mere dost",kfid)
                 pos = sem.get('pose', None)
+                print(pos)
+                print(self.keyframe_poses)
                 if pos is None and int(kfid) in self.keyframe_poses:
                     pos = self.keyframe_poses[int(kfid)]['pose']
+                    print("pos is this", pos)
                 if pos is None:
                     continue
                 # recency and floor
-                if now - sem.get('stamp', 0.0) > self.kf_association_time_s:
-                    continue
-                if sem.get('floor', -1) != -1 and sem.get('floor', -1) != floor_id:
-                    continue
+                print(now - sem.get('stamp', 0.0) - self.kf_association_time_s)
+                # if now - sem.get('stamp', 0.0) > self.kf_association_time_s:
+                #     continue
+                # if sem.get('floor', -1) != -1 and sem.get('floor', -1) != floor_id:
+                #     continue
+                print("Before even trying")
+                pt = ShapelyPoint(pos[0], pos[1])
+                print(pt)
+                print(poly.contains(pt))
+                self.visualize_point(pt)
+                self.visualize_polygon(poly)
                 try:
                     pt = ShapelyPoint(pos[0], pos[1])
                     if poly.contains(pt) or poly.touches(pt):
                         result.add(int(kfid))
-                except Exception:
+                except Exception: 
+                    print("Problem in poly ni ho paya kuch")
                     continue
             # also check pose-only keyframe_poses not represented in kf_semantics
             for kfid, rec in self.keyframe_poses.items():
@@ -666,7 +871,9 @@ class ZonesNode(Node):
                 return list(result)
 
         # 4) proximity to cluster_center fallback
+        print("Aagaye cluster centering pe?", cluster_center)
         if cluster_center is not None:
+            print("Kya hora hai bhai?")
             cx, cy = cluster_center
             # check semantics with pose first
             for kfid, sem in self.kf_semantics.items():

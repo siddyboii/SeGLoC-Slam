@@ -31,7 +31,7 @@ float PlaneUtils::width_between_planes(
   plane1_eigen << plane1.nx, plane1.ny, plane1.nz, plane1.d;
   plane2_eigen << plane2.nx, plane2.ny, plane2.nz, plane2.d;
   float size = 0;
-
+  std::cout<<"DOT PRODUCT VALUE IS "<<plane1_eigen.head(3).dot(plane2_eigen.head(3))<<std::endl;
   if (plane1_eigen.head(3).dot(plane2_eigen.head(3)) > 0) return 0;
 
   correct_plane_direction(plane1_eigen);
