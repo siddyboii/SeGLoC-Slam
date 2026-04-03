@@ -87,15 +87,15 @@ class ZonesClusterNode(Node):
 
         # ---- parameters ----
         self.declare_parameter('publish_rate', 1.0)
-        self.declare_parameter('clustering_period', 2.0)
-        self.declare_parameter('window_duration_s', 120.0)
+        self.declare_parameter('clustering_period', 3.0) #2.0
+        self.declare_parameter('window_duration_s', 200.0)#120
         self.declare_parameter('min_samples', 3)
-        self.declare_parameter('eps_m', 1.8)  # in meters (but will be applied after feature scaling)
+        self.declare_parameter('eps_m', 3.0)  # 1.8 in meters (but will be applied after feature scaling)
         self.declare_parameter('w_sem', 2.0)  # semantic weight
         self.declare_parameter('min_kfs_confirm', 3)
         self.declare_parameter('purity_thresh', 0.6)
         self.declare_parameter('temporal_confirm_s', 8.0)
-        self.declare_parameter('merge_dist_m', 2.0)
+        self.declare_parameter('merge_dist_m', 4.0) #2.0
         self.declare_parameter('merge_semantic_thresh', 0.7)
         self.declare_parameter('zone_confidence_base', 0.5)
         self.declare_parameter('visualize', True)

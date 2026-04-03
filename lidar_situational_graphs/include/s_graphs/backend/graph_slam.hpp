@@ -71,6 +71,8 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #include <g2o/vertex_infinite_room.hpp>
 #include <g2o/vertex_room.hpp>
 #include <g2o/vertex_wall.hpp>
+#include "g2o/vertex_zone.hpp"
+#include "g2o/edge_zone_keyframe.hpp"
 #include <memory>
 
 #include "rclcpp/rclcpp.hpp"
@@ -114,6 +116,8 @@ class VertexRoom;
 class VertexFloor;
 class VertexDoorWay;
 class VertexDeviation;
+class VertexZone;
+class EdgeZoneKeyframe;
 }  // namespace g2o
 
 namespace s_graphs {
@@ -136,6 +140,78 @@ class GraphSLAM {
   void set_total_nbr_of_vertices(const int vertices);
   void set_total_nbr_of_edges(const int edges);
 
+    /**
+   * @brief Add a zone node to the graph
+   *
+   * @param zone_pose
+   * @param id
+   * @return Registered node
+   */
+  g2o::VertexZone* add_zone_node(const Eigen::Isometry3d& zone_pose,
+                                 const int& id = -1);
+
+  /**
+   * @brief Copy a zone node from another graph
+   *
+   * @param node
+   * @return Registered node
+   */
+  g2o::VertexZone* copy_zone_node(const g2o::VertexZone* node);
+
+  /**
+   * @brief Remove a zone node from the graph
+   *
+   * @param zone_vertex
+   * @return success or failure
+   */
+  bool remove_zone_node(g2o::VertexZone* zone_vertex);
+
+  /**
+   * @brief Add a soft factor between a keyframe pose and a zone pose
+   * Uses the existing EdgeSE3Room type because VertexZone derives from VertexRoom.
+   *
+   * @param v_kf
+   * @param v_zone
+   * @param measurement
+   * @param information
+   * @return registered edge
+   */
+//   g2o::EdgeSE3Room* add_zone_keyframe_edge(g2o::VertexSE3* v_kf,
+//                                            g2o::VertexZone* v_zone,
+//                                            const Eigen::Isometry3d& measurement,
+//                                            const Eigen::MatrixXd& information);
+    // g2o::EdgeZoneKeyframe* add_zone_keyframe_edge(g2o::VertexSE3* v_kf,
+    //                                                 g2o::VertexZone* v_zone,
+    //                                                 const Eigen::Isometry3d& measurement,
+    //                                                 const Eigen::MatrixXd& information);
+    g2o::EdgeZoneKeyframe* add_zone_keyframe_edge(g2o::VertexSE3* v_kf,
+                                                g2o::VertexZone* v_zone,
+                                                int zone_id,
+                                                int keyframe_id,
+                                                const Eigen::Isometry3d& measurement,
+                                                const Eigen::MatrixXd& information);
+
+
+    /**
+   * @brief Add a soft factor between a floor and a zone
+   * Uses EdgeFloorRoom because VertexZone derives from VertexRoom.
+   *
+   * @param v_floor
+   * @param v_zone
+   * @param measurement
+   * @param information
+   * @return registered edge
+   */
+  g2o::EdgeFloorRoom* add_floor_zone_edge(g2o::VertexFloor* v_floor,
+                                          g2o::VertexZone* v_zone,
+                                          const Eigen::Vector3d& measurement,
+                                          const Eigen::MatrixXd& information);
+    
+  g2o::VertexZone* get_zone_node(const int& zone_id) const;
+
+  g2o::EdgeZoneKeyframe* get_zone_edge_by_id(int edge_id);
+
+  int make_zone_edge_id(int zone_id, int keyframe_id) const;
   /**
    * @brief Counts the number of vertices in the graph.
    *
@@ -956,6 +1032,15 @@ class GraphSLAM {
   double sum_prev_timings;
   bool save_compute_time;
   std::ofstream time_recorder;
+
+ private:
+  static constexpr int ZONE_VERTEX_ID_BASE = 1000000;
+  static constexpr int ZONE_EDGE_ID_BASE   = 2000000;
+
+  int zone_edge_serial_ = 2000000; // 0
+
+  int next_zone_edge_id();
+  bool zone_edge_id_exists(int candidate) const ;
 };
 
 }  // namespace s_graphs

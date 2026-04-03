@@ -36,6 +36,8 @@ G2O_REGISTER_TYPE(VERTEX_ROOM, VertexRoom)
 G2O_REGISTER_TYPE(VERTEX_FLOOR, VertexFloor)
 G2O_REGISTER_TYPE(VERTEX_DEVIATION, VertexDeviation)
 G2O_REGISTER_TYPE(VERTEX_INFINITE_ROOM, VertexInfiniteRoom)
+G2O_REGISTER_TYPE(VERTEX_ZONE, VertexZone)
+G2O_REGISTER_TYPE(EDGE_ZONE_KEYFRAME, EdgeZoneKeyframe)
 }  // namespace g2o
 
 namespace s_graphs {
@@ -144,6 +146,178 @@ g2o::VertexSE3* GraphSLAM::add_se3_node(const Eigen::Isometry3d& pose,
 
   return vertex;
 }
+
+bool GraphSLAM::zone_edge_id_exists(int candidate) const {
+  for (const auto* e : graph->edges()) {
+    if (e && e->id() == candidate) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// int GraphSLAM::next_zone_edge_id() {
+//   // Start from the largest existing edge id + 1.
+//   // This avoids collisions with edges already in the persistent optimizer.
+//   int max_id = zone_edge_serial_;
+
+//   for (const auto* e : graph->edges()) {
+//     if (e) {
+//       max_id = std::max(max_id, e->id() + 1);
+//     }
+//   }
+
+//   zone_edge_serial_ = max_id;
+//   return zone_edge_serial_++;
+// }
+// Change this to use a simple class member counter
+int GraphSLAM::next_zone_edge_id() {
+    // Initialize zone_edge_serial_ to a high number in your constructor (e.g., 2000000)
+    return zone_edge_serial_++; 
+}
+
+int GraphSLAM::make_zone_edge_id(int zone_id, int keyframe_id) const {
+  // Stable pair-based id. Keep it far from the normal graph ids.
+  return 100000000 + zone_id * 100000 + keyframe_id;
+}
+
+g2o::EdgeZoneKeyframe* GraphSLAM::get_zone_edge_by_id(int edge_id) {
+  if (graph->edges().empty()) return nullptr;
+  for (auto* e : graph->edges()) {
+    if (e && e->id() == edge_id) {
+      return dynamic_cast<g2o::EdgeZoneKeyframe*>(e);
+    }
+  }
+  return nullptr;
+}
+
+g2o::VertexZone* GraphSLAM::add_zone_node(const Eigen::Isometry3d& zone_pose,
+                                          const int& zone_id) {
+  const int v_id = ZONE_VERTEX_ID_BASE + zone_id;
+  std::cout<<"!!!!!!!!!!!Addded Vertex ID !!!!!!!!!!!!!!!!!!"<<v_id<<std::endl;
+
+  if (auto* existing = dynamic_cast<g2o::VertexZone*>(graph->vertex(v_id))) {
+    existing->setEstimate(zone_pose);
+    return existing;
+  }
+
+  g2o::VertexZone* vertex(new g2o::VertexZone());
+  vertex->setId(v_id);
+  vertex->setEstimate(zone_pose);
+  graph->addVertex(vertex);
+  return vertex;
+}
+
+g2o::VertexZone* GraphSLAM::copy_zone_node(const g2o::VertexZone* node) {
+  const int v_id = node->id();
+
+  if (auto* existing = dynamic_cast<g2o::VertexZone*>(graph->vertex(v_id))) {
+    existing->setEstimate(node->estimate());
+    if (node->fixed()) existing->setFixed(true);
+    return existing;
+  }
+
+  g2o::VertexZone* vertex(new g2o::VertexZone());
+  vertex->setId(v_id);
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+  return vertex;
+}
+
+bool GraphSLAM::remove_zone_node(g2o::VertexZone* zone_vertex) {
+  if (zone_vertex == nullptr) return false;
+  return graph->removeVertex(zone_vertex);
+}
+
+// g2o::EdgeSE3Room* GraphSLAM::add_zone_keyframe_edge(g2o::VertexSE3* v_kf,
+//                                                     g2o::VertexZone* v_zone,
+//                                                     const Eigen::Isometry3d& measurement,
+//                                                     const Eigen::MatrixXd& information) {
+//   g2o::EdgeSE3Room* edge(new g2o::EdgeSE3Room());
+//   //edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+//   int edge_id = next_zone_edge_id();
+//   std::cout<<"####################### Edge_id is : "<< edge_id << std::endl;
+//   edge->setId(edge_id);
+//   edge->setMeasurement(measurement);
+//   edge->setInformation(information);
+//   edge->vertices()[0] = v_kf;
+//   edge->vertices()[1] = static_cast<g2o::VertexRoom*>(v_zone);
+//   graph->addEdge(edge);
+//   //this->increment_local_nbr_of_edges();
+//   return edge;
+// }
+// g2o::EdgeZoneKeyframe* GraphSLAM::add_zone_keyframe_edge(
+//     g2o::VertexSE3* v_kf,
+//     g2o::VertexZone* v_zone,
+//     const Eigen::Isometry3d& measurement,
+//     const Eigen::MatrixXd& information) {
+//   if (!v_kf || !v_zone) return nullptr;
+
+//   g2o::EdgeZoneKeyframe* edge = new g2o::EdgeZoneKeyframe();
+//   edge->setId(next_zone_edge_id());
+//   edge->setVertex(0, v_kf);
+//   edge->setVertex(1, v_zone);
+//   edge->setMeasurement(measurement);
+//   edge->setInformation(information);
+//   graph->addEdge(edge);
+
+//   // if (!graph->addEdge(edge)) {
+//   //   delete edge;
+//   //   return nullptr;
+//   // }
+
+//   return edge;
+// }
+g2o::EdgeZoneKeyframe* GraphSLAM::add_zone_keyframe_edge(
+    g2o::VertexSE3* v_kf,
+    g2o::VertexZone* v_zone,
+    int zone_id,
+    int keyframe_id,
+    const Eigen::Isometry3d& measurement,
+    const Eigen::MatrixXd& information) {
+  if (!v_kf || !v_zone) return nullptr;
+
+  // const int edge_id = make_zone_edge_id(zone_id, keyframe_id);
+
+  // // Upsert behavior: if edge already exists, update it.
+  // if (auto* existing = get_zone_edge_by_id(edge_id)) {
+  //   existing->setVertex(0, v_kf);
+  //   existing->setVertex(1, v_zone);
+  //   existing->setMeasurement(measurement);
+  //   existing->setInformation(information);
+  //   return existing;
+  // }
+  const int edge_id = next_zone_edge_id();
+
+  g2o::EdgeZoneKeyframe* edge = new g2o::EdgeZoneKeyframe();
+  edge->setId(edge_id);
+  edge->setVertex(0, v_kf);
+  edge->setVertex(1, v_zone);
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+
+  if (!graph->addEdge(edge)) {
+    delete edge;
+    return nullptr;
+  }
+
+  return edge;
+}
+// g2o::EdgeFloorRoom* GraphSLAM::add_floor_zone_edge(g2o::VertexFloor* v_floor,
+//                                                    g2o::VertexZone* v_zone,
+//                                                    const Eigen::Vector3d& measurement,
+//                                                    const Eigen::MatrixXd& information) {
+//   g2o::EdgeFloorRoom* edge(new g2o::EdgeFloorRoom());
+//   edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+//   edge->setMeasurement(measurement);
+//   edge->setInformation(information);
+//   edge->vertices()[0] = v_floor;
+//   edge->vertices()[1] = static_cast<g2o::VertexRoom*>(v_zone);
+//   graph->addEdge(edge);
+//   this->increment_local_nbr_of_edges();
+//   return edge;
+// }
 
 g2o::VertexSE3* GraphSLAM::copy_se3_node(const g2o::VertexSE3* node) {
   g2o::VertexSE3* vertex(new g2o::VertexSE3());

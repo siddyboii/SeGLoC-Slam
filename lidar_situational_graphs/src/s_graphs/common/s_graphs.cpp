@@ -252,6 +252,13 @@ SGraphsNode::SGraphsNode() : Node("s_graphs_node") {
         std::bind(&SGraphsNode::navsat_callback, this, std::placeholders::_1),
         sub_opt);
   }
+  rclcpp::QoS qos(rclcpp::KeepLast(10));
+  qos.transient_local();
+  zone_sub_ = this->create_subscription<situational_graphs_msgs::msg::Zone>(
+    "zones",
+    qos,
+    std::bind(&SGraphsNode::zone_data_callback, this, std::placeholders::_1),
+    sub_opt);
 
   callback_group_publisher =
       this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1364,14 +1371,126 @@ void SGraphsNode::keyframe_update_timer_callback() {
                 rooms_vec);
 }
 
+// void SGraphsNode::optimization_timer_callback() {
+//   if (keyframes.empty() || floors_vec.empty()) return;
+
+//   int num_iterations =
+//       this->get_parameter("g2o_solver_num_iterations").get_parameter_value().get<int>();
+
+//   curr_edge_count = covisibility_graph->retrieve_total_nbr_of_edges();
+//   if (curr_edge_count == prev_edge_count) {
+//     return;
+//   }
+
+//   graph_mutex.lock();
+//   const int keyframe_id = keyframes.rbegin()->first;
+//   graph_mutex.unlock();
+
+//   switch (ongoing_optimization_class) {
+//     case optimization_class::GLOBAL: {
+//       handle_global_optimization();
+//       break;
+//     }
+
+//     case optimization_class::LOCAL_GLOBAL: {
+//       handle_local_global_optimization();
+//       break;
+//     }
+
+//     case optimization_class::FLOOR_GLOBAL: {
+//       handle_floor_global_optimization();
+//       break;
+//     }
+
+//     default:
+//       break;
+//   }
+
+//   // optimize the pose graph
+//   try {
+//     graph_mutex.lock();
+//     if (!global_optimization)
+//       compressed_graph->optimize("local", num_iterations);
+//     else {
+//       compressed_graph->optimize("global", num_iterations);
+//     }
+//     graph_mutex.unlock();
+//   } catch (std::invalid_argument& e) {
+//     std::cout << e.what() << std::endl;
+//     throw 1;
+//   }
+
+//   graph_mutex.lock();
+//   std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
+//   auto updated_planes_tuple =
+//       std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
+
+//   GraphUtils::update_graph(compressed_graph,
+//                            keyframes,
+//                            x_vert_planes,
+//                            y_vert_planes,
+//                            hort_planes,
+//                            rooms_vec,
+//                            x_infinite_rooms,
+//                            y_infinite_rooms,
+//                            floors_vec,
+//                            updated_planes_tuple);
+
+//   if (global_optimization) {
+//     plane_mapper->convert_plane_points_to_map(
+//         x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
+//   }
+
+//   Eigen::Isometry3d trans =
+//       keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
+
+//   // publish tf
+//   geometry_msgs::msg::TransformStamped ts =
+//       matrix2transform(keyframes[keyframe_id]->stamp,
+//                        trans.matrix().cast<float>(),
+//                        map_frame_id,
+//                        odom_frame_id);
+//   odom2map_pub->publish(ts);
+//   graph_mutex.unlock();
+
+//   trans_odom2map_mutex.lock();
+//   trans_odom2map = trans.matrix().cast<float>();
+//   trans_odom2map_mutex.unlock();
+
+//   if (ongoing_optimization_class == optimization_class::LOCAL_GLOBAL ||
+//       ongoing_optimization_class == optimization_class::FLOOR_GLOBAL) {
+//     int counter = 0;
+//     for (const auto& room_local_graph_id : room_local_graph_id_queue) {
+//       broadcast_room_graph(room_local_graph_id, num_iterations);
+//       counter++;
+//     }
+
+//     if (!room_local_graph_id_queue.empty()) {
+//       graph_mutex.lock();
+//       room_local_graph_id_queue.erase(room_local_graph_id_queue.begin(),
+//                                       room_local_graph_id_queue.begin() + counter);
+//       graph_mutex.unlock();
+//     }
+  // } else {
+  //   graph_mutex.lock();
+  //   room_local_graph_id_queue.clear();
+  //   graph_mutex.unlock();
+  // }
+
+//   prev_edge_count = curr_edge_count;
+// }
 void SGraphsNode::optimization_timer_callback() {
+  std::lock_guard<std::mutex> cycle_lock(graph_cycle_mutex_);
   if (keyframes.empty() || floors_vec.empty()) return;
 
   int num_iterations =
       this->get_parameter("g2o_solver_num_iterations").get_parameter_value().get<int>();
 
   curr_edge_count = covisibility_graph->retrieve_total_nbr_of_edges();
+  RCLCPP_INFO_STREAM(this->get_logger(),"Returning because Zones_dirty is : "<< !zones_dirty_);
+  RCLCPP_INFO_STREAM(this->get_logger(),"The current Edge count is : "<< curr_edge_count);
   if (curr_edge_count == prev_edge_count) {
+     RCLCPP_INFO_STREAM(this->get_logger(),"Returning from edge count check");
     return;
   }
 
@@ -1380,75 +1499,92 @@ void SGraphsNode::optimization_timer_callback() {
   graph_mutex.unlock();
 
   switch (ongoing_optimization_class) {
-    case optimization_class::GLOBAL: {
+    case optimization_class::GLOBAL:
       handle_global_optimization();
       break;
-    }
-
-    case optimization_class::LOCAL_GLOBAL: {
+    case optimization_class::LOCAL_GLOBAL:
       handle_local_global_optimization();
       break;
-    }
-
-    case optimization_class::FLOOR_GLOBAL: {
+    case optimization_class::FLOOR_GLOBAL:
       handle_floor_global_optimization();
       break;
-    }
-
     default:
       break;
   }
 
-  // optimize the pose graph
   try {
     graph_mutex.lock();
-    if (!global_optimization)
+
+    // IMPORTANT: update compressed graph first
+    std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
+    auto updated_planes_tuple =
+        std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
+        RCLCPP_INFO_STREAM(this->get_logger(),"Before Updating graph");
+
+    GraphUtils::update_graph(compressed_graph,
+                             keyframes,
+                             x_vert_planes,
+                             y_vert_planes,
+                             hort_planes,
+                             rooms_vec,
+                             x_infinite_rooms,
+                             y_infinite_rooms,
+                             floors_vec,
+                             updated_planes_tuple);
+
+    // Add/refresh zone factors before optimization
+    if (zones_dirty_ || graph_rebuilt_since_last_zone_sync_) {
+      //attach_zone_factors_to_graph();
+      RCLCPP_INFO_STREAM(this->get_logger(),"GOING TO ADD ZONES FACTOR NOWW");
+      sync_zone_layer_to_graph();
+    }
+    RCLCPP_INFO_STREAM(this->get_logger(),"About to call the optimization ");
+
+    if (!global_optimization) {
       compressed_graph->optimize("local", num_iterations);
-    else {
+    } else {
       compressed_graph->optimize("global", num_iterations);
     }
+
+    // Recompute graph state after optimization
+    GraphUtils::update_graph(compressed_graph,
+                             keyframes,
+                             x_vert_planes,
+                             y_vert_planes,
+                             hort_planes,
+                             rooms_vec,
+                             x_infinite_rooms,
+                             y_infinite_rooms,
+                             floors_vec,
+                             updated_planes_tuple);
+
+    if (global_optimization) {
+      plane_mapper->convert_plane_points_to_map(
+          x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
+    }
+
+    Eigen::Isometry3d trans =
+        keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
+
+    geometry_msgs::msg::TransformStamped ts =
+        matrix2transform(keyframes[keyframe_id]->stamp,
+                         trans.matrix().cast<float>(),
+                         map_frame_id,
+                         odom_frame_id);
+    odom2map_pub->publish(ts);
+
+    trans_odom2map_mutex.lock();
+    trans_odom2map = trans.matrix().cast<float>();
+    trans_odom2map_mutex.unlock();
+
+    prev_edge_count = compressed_graph->retrieve_total_nbr_of_edges();
     graph_mutex.unlock();
+
   } catch (std::invalid_argument& e) {
+    graph_mutex.unlock();
     std::cout << e.what() << std::endl;
     throw 1;
   }
-
-  graph_mutex.lock();
-  std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
-  auto updated_planes_tuple =
-      std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
-
-  GraphUtils::update_graph(compressed_graph,
-                           keyframes,
-                           x_vert_planes,
-                           y_vert_planes,
-                           hort_planes,
-                           rooms_vec,
-                           x_infinite_rooms,
-                           y_infinite_rooms,
-                           floors_vec,
-                           updated_planes_tuple);
-
-  if (global_optimization) {
-    plane_mapper->convert_plane_points_to_map(
-        x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
-  }
-
-  Eigen::Isometry3d trans =
-      keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
-
-  // publish tf
-  geometry_msgs::msg::TransformStamped ts =
-      matrix2transform(keyframes[keyframe_id]->stamp,
-                       trans.matrix().cast<float>(),
-                       map_frame_id,
-                       odom_frame_id);
-  odom2map_pub->publish(ts);
-  graph_mutex.unlock();
-
-  trans_odom2map_mutex.lock();
-  trans_odom2map = trans.matrix().cast<float>();
-  trans_odom2map_mutex.unlock();
 
   if (ongoing_optimization_class == optimization_class::LOCAL_GLOBAL ||
       ongoing_optimization_class == optimization_class::FLOOR_GLOBAL) {
@@ -1464,19 +1600,37 @@ void SGraphsNode::optimization_timer_callback() {
                                       room_local_graph_id_queue.begin() + counter);
       graph_mutex.unlock();
     }
-  } else {
+    else {
     graph_mutex.lock();
     room_local_graph_id_queue.clear();
     graph_mutex.unlock();
+    }
   }
 
   prev_edge_count = curr_edge_count;
+  RCLCPP_INFO_STREAM(this->get_logger(),"Republishing the graph i dont know if this is needed or not");
+  publish_graph(covisibility_graph->graph.get(),
+                keyframes,
+                x_vert_planes,
+                y_vert_planes,
+                x_infinite_rooms,
+                y_infinite_rooms,
+                rooms_vec);
 }
 
 void SGraphsNode::handle_global_optimization() {
   std::lock_guard<std::mutex> lock(graph_mutex);
+  // CRITICAL: Clear these so we don't have pointers to deleted memory
+  // zone_vertices_.clear();
+  // zone_edges_.clear();
+  // zone_edge_versions_.clear();
+  // keyframe_to_zone_.clear();
+
   GraphUtils::copy_graph(covisibility_graph, compressed_graph, keyframes);
   global_optimization = true;
+  zones_dirty_ = true;
+  graph_rebuilt_since_last_zone_sync_ = true;
+
 }
 
 void SGraphsNode::handle_local_global_optimization() {
@@ -1562,6 +1716,7 @@ void SGraphsNode::copy_data(
 }
 
 void SGraphsNode::map_publish_timer_callback(bool pass) {
+  std::lock_guard<std::mutex> cycle_lock(graph_cycle_mutex_);
   RCLCPP_INFO(this->get_logger(), 
               "[S_GRAPHS DEBUG] ========== map_publish_timer_callback TRIGGERED ==========");
   RCLCPP_INFO(this->get_logger(), 
@@ -2043,16 +2198,32 @@ void SGraphsNode::publish_graph(
   graph_mutex.lock();
   auto graph_keyframes = graph_publisher->publish_graph_keyframes(
       local_covisibility_graph, keyframes_complete_snapshot, dump_directory);
+      RCLCPP_INFO(this->get_logger(), "Num keyframes: %zu", graph_keyframes.keyframes.size());
+      for (const auto& kf : graph_keyframes.keyframes)
+        {
+          const auto& p = kf.pose.position;
+          const auto& q = kf.pose.orientation;
+
+          RCLCPP_INFO(this->get_logger(),
+            "Pose -> position: [%.2f, %.2f, %.2f], orientation: [%.2f, %.2f, %.2f, %.2f]",
+            p.x, p.y, p.z,
+            q.x, q.y, q.z, q.w);
+        }
   graph_mutex.unlock();
 
   graph_pub->publish(graph_structure);
   graph_keyframes_pub->publish(graph_keyframes);
-    // -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
   // Publish KeyframeSemantic messages for graph-assigned keyframes
   // This publishes semantics *after* graph_keyframes are created so we have
   // canonical keyframe_id and pose consistent with the graph.
   // Thread-safely read the KeyFrame contents (use keyframe_mutex_).
   // -----------------------------------------------------------------------
+  std::unordered_map<int32_t, geometry_msgs::msg::Pose> graph_pose_by_id;
+    for (const auto& gkf : graph_keyframes.keyframes) {
+      graph_pose_by_id[gkf.id] = gkf.pose;
+    }
+
   if (keyframe_semantic_pub_ && publish_semantics_with_graph_) {
     try {
       for (const auto &kv : keyframes_complete_snapshot) {
@@ -2086,18 +2257,31 @@ void SGraphsNode::publish_graph(
         kmsg.room_id = -1;
 
         // Pose: from keyframe->odom (same as processSemantic used)
+        // {
+        //   geometry_msgs::msg::Pose p;
+        //   Eigen::Vector3d t = kf->odom.translation();
+        //   Eigen::Quaterniond q(kf->odom.rotation());
+        //   p.position.x = static_cast<double>(t.x());
+        //   p.position.y = static_cast<double>(t.y());
+        //   p.position.z = static_cast<double>(t.z());
+        //   p.orientation.x = q.x();
+        //   p.orientation.y = q.y();
+        //   p.orientation.z = q.z();
+        //   p.orientation.w = q.w();
+        //   kmsg.pose = p;
+        // }
+        // Pose: use graph-assigned pose for this keyframe id
         {
-          geometry_msgs::msg::Pose p;
-          Eigen::Vector3d t = kf->odom.translation();
-          Eigen::Quaterniond q(kf->odom.rotation());
-          p.position.x = static_cast<double>(t.x());
-          p.position.y = static_cast<double>(t.y());
-          p.position.z = static_cast<double>(t.z());
-          p.orientation.x = q.x();
-          p.orientation.y = q.y();
-          p.orientation.z = q.z();
-          p.orientation.w = q.w();
-          kmsg.pose = p;
+          int32_t kf_id = static_cast<int32_t>(kf->id());
+
+          auto it = graph_pose_by_id.find(kf_id);
+          if (it != graph_pose_by_id.end()) {
+            kmsg.pose = it->second;
+          } else {
+            RCLCPP_WARN(this->get_logger(),
+                        "No graph pose found for keyframe id %d", kf_id);
+            continue;
+          }
         }
 
         // Objects + confidences (read under lock)
@@ -3272,6 +3456,594 @@ void SGraphsNode::dynamic_objects_callback(
       "[DYNAMICITY] Scene dynamicity: %.3f, clusters: %d, dyn_pixels: %d/%d",
       dyn_msg->scene_dynamicity, dyn_msg->num_dynamic_clusters,
       dyn_msg->total_dynamic_pixels, dyn_msg->total_occupied_pixels);
+}
+double compute_zone_spread_from_keyframes(
+    const std::vector<int>& keyframe_ids,
+    const std::map<int, KeyFrame::Ptr>& keyframes) {
+  std::vector<Eigen::Vector3d> pts;
+  pts.reserve(keyframe_ids.size());
+
+  for (int kf_id : keyframe_ids) {
+    auto it = keyframes.find(kf_id);
+    if (it == keyframes.end() || it->second == nullptr || it->second->node == nullptr) {
+      continue;
+    }
+    pts.push_back(it->second->node->estimate().translation());
+  }
+
+  if (pts.empty()) {
+    return 1.0;
+  }
+
+  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+  for (const auto& p : pts) mean += p;
+  mean /= static_cast<double>(pts.size());
+
+  double accum = 0.0;
+  for (const auto& p : pts) {
+    accum += (p - mean).norm();
+  }
+
+  return accum / static_cast<double>(pts.size());
+}
+
+Eigen::MatrixXd zone_information_matrix(double confidence, double spread) {
+  const double base_info = 1.0;
+  double w = base_info * (1.0 + 10.0 * confidence) / (1.0 + spread);
+  w = std::max(0.05, std::min(w, 10.0));
+  return Eigen::MatrixXd::Identity(6, 6) * w;
+}
+
+void SGraphsNode::zone_data_callback(
+    const situational_graphs_msgs::msg::Zone::SharedPtr zone_msg) {
+  std::lock_guard<std::mutex> lock(zone_mutex_);
+
+  const int zid = static_cast<int>(zone_msg->zone_id);
+  RCLCPP_INFO(this->get_logger(), "Triggered Zone Data Callback");
+
+  if (zone_msg->action == 2) {
+    // Soft delete: invalidate record and stop using it for new factors.
+    auto it = zone_records_.find(zid);
+    if (it != zone_records_.end()) {
+      it->second.valid = false;
+    }
+    zones_dirty_ = true;
+    return;
+  }
+
+  ZoneRecord rec;
+  rec.zone_id = zid;
+  rec.floor_id = static_cast<int>(zone_msg->floor_id);
+  rec.centroid_pose = Eigen::Isometry3d::Identity();
+  rec.centroid_pose.translation().x() = zone_msg->centroid.position.x;
+  rec.centroid_pose.translation().y() = zone_msg->centroid.position.y;
+  rec.centroid_pose.translation().z() = zone_msg->centroid.position.z;
+  rec.room_ids.assign(zone_msg->room_ids.begin(), zone_msg->room_ids.end());
+  rec.keyframe_ids.assign(zone_msg->keyframe_ids.begin(), zone_msg->keyframe_ids.end());
+  rec.top_labels.assign(zone_msg->top_labels.begin(), zone_msg->top_labels.end());
+  rec.top_label_confidences.assign(zone_msg->top_label_confidences.begin(),
+                                   zone_msg->top_label_confidences.end());
+  rec.confidence = zone_msg->confidence;
+  rec.version = zone_msg->version;
+  rec.action = zone_msg->action;
+  rec.valid = true;
+
+  zone_records_[zid] = rec;
+
+  for (int kf_id : rec.keyframe_ids) {
+    keyframe_to_zone_[kf_id] = zid;
+  }
+
+  zones_dirty_ = true;
+  RCLCPP_INFO_STREAM(this->get_logger(),"============================VERY IMPORTANT SETTNIG ZONES_DIRTY=========================="<<zones_dirty_);
+
+  RCLCPP_INFO(this->get_logger(),
+              "[S_GRAPHS] Zone update received: zone=%d floor=%d kfs=%zu conf=%.3f version=%lu",
+              zid, rec.floor_id, rec.keyframe_ids.size(), rec.confidence, rec.version);
+}
+
+// void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe) {
+//   if (!keyframe || keyframe->node == nullptr) return;
+
+//   const int kf_id = static_cast<int>(keyframe->id());
+
+//   ZoneRecord zone_rec;
+//   {
+//     std::lock_guard<std::mutex> lock(zone_mutex_);
+//     auto it = keyframe_to_zone_.find(kf_id);
+//     if (it == keyframe_to_zone_.end()) {
+//       return;
+//     }
+//     int zone_id = it->second;
+//     auto zit = zone_records_.find(zone_id);
+//     if (zit == zone_records_.end()) {
+//       return;
+//     }
+//     zone_rec = zit->second;
+//   }
+
+//   if (!zone_rec.valid) return;
+//   if (zone_rec.confidence < zone_confidence_threshold_) return;
+//   if (keyframe->floor_level != zone_rec.floor_id) return;
+
+//   // Do not add duplicate keyframe-zone edges
+//   const auto edge_key = std::make_pair(zone_rec.zone_id, kf_id);
+//   if (attached_zone_keyframe_edges_.count(edge_key)) {
+//     return;
+//   }
+
+//   // Ensure vertex exists
+//   g2o::VertexZone* zone_vertex = nullptr;
+//   auto zv_it = zone_vertices_.find(zone_rec.zone_id);
+//   if (zv_it == zone_vertices_.end() || zv_it->second == nullptr) {
+//     zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose, zone_rec.zone_id);
+//     RCLCPP_INFO_STREAM(this->get_logger(), "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+//     zone_vertices_[zone_rec.zone_id] = zone_vertex;
+//   } else {
+//     zone_vertex = zv_it->second;
+//     zone_vertex->setEstimate(zone_rec.centroid_pose);
+//   }
+
+//   // Measurement = relative pose from keyframe to zone centroid
+//   Eigen::Isometry3d measurement = keyframe->node->estimate().inverse() * zone_rec.centroid_pose;
+//   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+  
+//   spread = std::max(spread, 0.5);  // prevents zero-spread overconfidence
+
+//   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+
+//   auto* edge = compressed_graph->add_zone_keyframe_edge(
+//       keyframe->node, zone_vertex, measurement, information);
+//   compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+
+//   attached_zone_keyframe_edges_.insert(edge_key);
+
+//   RCLCPP_INFO(this->get_logger(),
+//               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+// }
+////////////////////////////////////////////////////////////////////////////////////SOME WHAT WORKING////////////////////////////////
+// void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe) {
+//   if (!keyframe || !keyframe->node) return;
+
+//   const int kf_id = static_cast<int>(keyframe->id());
+
+//   ZoneRecord zone_rec;
+//   {
+//     std::lock_guard<std::mutex> lock(zone_mutex_);
+//     auto it = keyframe_to_zone_.find(kf_id);
+//     if (it == keyframe_to_zone_.end()) {
+//       return;
+//     }
+
+//     auto zit = zone_records_.find(it->second);
+//     if (zit == zone_records_.end()) {
+//       return;
+//     }
+
+//     zone_rec = zit->second;
+//   }
+
+//   if (!zone_rec.valid) return;
+//   if (zone_rec.confidence < zone_confidence_threshold_) return;
+//   if (keyframe->floor_level != zone_rec.floor_id) return;
+
+//   const uint64_t pair_key =
+//       (static_cast<uint64_t>(zone_rec.zone_id) << 32) |
+//       static_cast<uint32_t>(kf_id);
+
+//   g2o::VertexZone* zone_vertex = nullptr;
+//   auto zv_it = zone_vertices_.find(zone_rec.zone_id);
+//   if (zv_it == zone_vertices_.end() || zv_it->second == nullptr) {
+//     zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose, zone_rec.zone_id);
+//     RCLCPP_INFO_STREAM(this->get_logger(), "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+//     zone_vertices_[zone_rec.zone_id] = zone_vertex;
+//   } else {
+//     zone_vertex = zv_it->second;
+//     zone_vertex->setEstimate(zone_rec.centroid_pose);
+//   }
+
+//   const Eigen::Isometry3d measurement =
+//       keyframe->node->estimate().inverse() * zone_rec.centroid_pose;
+
+//   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+//   spread = std::max(spread, 0.5);
+
+//   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+
+//   auto e_it = zone_edges_.find(pair_key);
+//   if (e_it != zone_edges_.end() && e_it->second) {
+//     // Update existing edge in place
+//     g2o::EdgeZoneKeyframe* edge = e_it->second;
+//     edge->setMeasurement(measurement);
+//     edge->setInformation(information);
+//     edge->setVertex(0, keyframe->node);
+//     edge->setVertex(1, zone_vertex);
+//     zone_edge_versions_[pair_key] = zone_rec.version;
+//   } else {
+//     // Create once
+//     g2o::EdgeZoneKeyframe* edge = compressed_graph->add_zone_keyframe_edge(
+//         keyframe->node, zone_vertex, measurement, information);
+
+//     if (!edge) {
+//       RCLCPP_ERROR(this->get_logger(),
+//                    "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+//                    kf_id, zone_rec.zone_id);
+//       return;
+//     }
+
+//     compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+
+//     zone_edges_[pair_key] = edge;
+//     zone_edge_versions_[pair_key] = zone_rec.version;
+//   }
+
+//   RCLCPP_INFO(this->get_logger(),
+//               "[S_GRAPHS] Attached/updated zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+// }
+// void SGraphsNode::attach_or_update_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe) {
+//   RCLCPP_ERROR(this->get_logger(),"HAATH JODTAAA HU CHAL JAA BHAII PLEASEE");
+  
+//   if (!keyframe) return;
+
+//   const int kf_id = static_cast<int>(keyframe->id());
+
+//   ZoneRecord zone_rec;
+//   {
+//     std::lock_guard<std::mutex> lock(zone_mutex_);
+//     auto it = keyframe_to_zone_.find(kf_id);
+//     if (it == keyframe_to_zone_.end()) return;
+
+//     auto zit = zone_records_.find(it->second);
+//     if (zit == zone_records_.end()) return;
+
+//     zone_rec = zit->second;
+//   }
+
+//   if (!zone_rec.valid) return;
+//   if (zone_rec.confidence < 0.3) return;
+
+//   //std::lock_guard<std::mutex> graph_lock(graph_mutex);
+
+//   // IMPORTANT:
+//   // Use the keyframe vertex that lives in the CURRENT optimizer graph.
+//   auto* kf_vertex = dynamic_cast<g2o::VertexSE3*>(
+//       compressed_graph->graph->vertex(kf_id));
+
+//   if (!kf_vertex) {
+//     RCLCPP_ERROR(this->get_logger(),
+//                  "[S_GRAPHS] Keyframe vertex %d not found in compressed graph",
+//                  kf_id);
+//     return;
+//   }
+
+//   // Same for zone vertex: use the CURRENT optimizer graph.
+  
+//   const int zone_vertex_id = 1000000 + zone_rec.zone_id;
+//   if(zone_vertex_id != prev_zone_vertex_id){
+
+  
+//   auto* zone_vertex = dynamic_cast<g2o::VertexZone*>(
+//       compressed_graph->graph->vertex(zone_vertex_id));
+
+//   if (!zone_vertex) {
+//     zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose,
+//                                                   zone_rec.zone_id);
+//     if (!zone_vertex) {
+//       RCLCPP_ERROR(this->get_logger(),
+//                    "[S_GRAPHS] Failed to create zone vertex for zone=%d",
+//                    zone_rec.zone_id);
+//       return;
+//     }
+//     RCLCPP_INFO(this->get_logger(),
+//                 "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+//   } else {
+//     zone_vertex->setEstimate(zone_rec.centroid_pose);
+//   }
+
+//   prev_zone_vertex_id = zone_vertex_id;
+
+//   // Keep the edge-specific key stable.
+//   const uint64_t pair_key =
+//       (static_cast<uint64_t>(zone_rec.zone_id) << 32) |
+//       static_cast<uint32_t>(kf_id);
+
+//   const Eigen::Isometry3d measurement =
+//       kf_vertex->estimate().inverse() * zone_vertex->estimate();
+
+//   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+//   spread = std::max(spread, 0.5);
+
+//   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+
+//   // If already tracked, update the existing edge.
+//   auto e_it = zone_edges_.find(pair_key);
+//   if (e_it != zone_edges_.end() && e_it->second) {
+//     auto* edge = e_it->second;
+//     edge->setVertex(0, kf_vertex);
+//     edge->setVertex(1, zone_vertex);
+//     edge->setMeasurement(measurement);
+//     edge->setInformation(information);
+
+//     RCLCPP_INFO(this->get_logger(),
+//                 "[S_GRAPHS] Updated zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//                 kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+//     return;
+//   }
+
+//   // Create once using graph-owned vertices only.
+//   auto* edge = compressed_graph->add_zone_keyframe_edge(
+//       kf_vertex,
+//       zone_vertex,
+//       zone_rec.zone_id,
+//       kf_id,
+//       measurement,
+//       information);
+
+//   if (!edge) {
+//     RCLCPP_ERROR(this->get_logger(),
+//                  "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+//                  kf_id, zone_rec.zone_id);
+//     return;
+//   }
+
+//   compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+//   zone_edges_[pair_key] = edge;
+
+//   RCLCPP_INFO(this->get_logger(),
+//               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+// }
+// }
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void SGraphsNode::clear_zone_layer_from_graph() {
+  for (int zone_vertex_id : zone_vertex_ids_in_graph_) {
+    auto* v = dynamic_cast<g2o::VertexZone*>(
+        compressed_graph->graph->vertex(zone_vertex_id));
+    if (v) {
+      compressed_graph->graph->removeVertex(v);
+    }
+  }
+
+  zone_vertex_ids_in_graph_.clear();
+}
+/////////////$$$$$$$$$$$$$$$$$$$$$/////////////////////////////
+
+// void SGraphsNode::attach_or_update_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe) {
+//   RCLCPP_ERROR(this->get_logger(),"HAATH JODTAAA HU CHAL JAA BHAII PLEASEE");
+  
+//   if (!keyframe) return;
+
+//   const int kf_id = static_cast<int>(keyframe->id());
+
+//   ZoneRecord zone_rec;
+//   {
+//     std::lock_guard<std::mutex> lock(zone_mutex_);
+//     auto it = keyframe_to_zone_.find(kf_id);
+//     if (it == keyframe_to_zone_.end()) return;
+
+//     auto zit = zone_records_.find(it->second);
+//     if (zit == zone_records_.end()) return;
+
+//     zone_rec = zit->second;
+//   }
+
+//   if (!zone_rec.valid) return;
+//   if (zone_rec.confidence < 0.3) return;
+
+//   //std::lock_guard<std::mutex> graph_lock(graph_mutex);
+
+//   // IMPORTANT:
+//   // Use the keyframe vertex that lives in the CURRENT optimizer graph.
+//   auto* kf_vertex = dynamic_cast<g2o::VertexSE3*>(
+//       compressed_graph->graph->vertex(kf_id));
+
+//   if (!kf_vertex) {
+//     RCLCPP_ERROR(this->get_logger(),
+//                  "[S_GRAPHS] Keyframe vertex %d not found in compressed graph",
+//                  kf_id);
+//     return;
+//   }
+
+//   // Same for zone vertex: use the CURRENT optimizer graph.
+  
+//   const int zone_vertex_id = 1000000 + zone_rec.zone_id;
+//   auto* zone_vertex = dynamic_cast<g2o::VertexZone*>(
+//       compressed_graph->graph->vertex(zone_vertex_id));
+
+//   if (!zone_vertex) {
+//     zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose,
+//                                                   zone_rec.zone_id);
+//     if (!zone_vertex) {
+//       RCLCPP_ERROR(this->get_logger(),
+//                    "[S_GRAPHS] Failed to create zone vertex for zone=%d",
+//                    zone_rec.zone_id);
+//       return;
+//     }
+//     RCLCPP_INFO(this->get_logger(),
+//                 "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+//   } else {
+//     zone_vertex->setEstimate(zone_rec.centroid_pose);
+//   }
+
+
+//   // Keep the edge-specific key stable.
+//   const uint64_t pair_key =
+//       (static_cast<uint64_t>(zone_rec.zone_id) << 32) |
+//       static_cast<uint32_t>(kf_id);
+
+//   const Eigen::Isometry3d measurement =
+//       kf_vertex->estimate().inverse() * zone_vertex->estimate();
+
+//   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+//   spread = std::max(spread, 0.5);
+
+//   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+
+//   bool edge_exists_and_valid = false;
+//   // If already tracked, update the existing edge.
+//   auto e_it = zone_edges_.find(pair_key);
+//   if (e_it != zone_edges_.end() && e_it->second != nullptr) {
+
+//     if (compressed_graph->graph->edges().find(e_it->second) != compressed_graph->graph->edges().end()) { //DOYBTFULLL
+//       edge_exists_and_valid = true;
+//     } else {
+//       zone_edges_.erase(e_it); // Remove the ghost pointer
+//     }
+//   }
+//     if (edge_exists_and_valid){
+
+//     auto* edge = e_it->second;
+//     edge->setVertex(0, kf_vertex);
+//     edge->setVertex(1, zone_vertex);
+//     edge->setMeasurement(measurement);
+//     edge->setInformation(information);
+
+//     RCLCPP_INFO(this->get_logger(),
+//                 "[S_GRAPHS] Updated zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//                 kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+//     return;
+//   }
+
+//   // Create once using graph-owned vertices only.
+//   auto* edge = compressed_graph->add_zone_keyframe_edge(
+//       kf_vertex,
+//       zone_vertex,
+//       zone_rec.zone_id,
+//       kf_id,
+//       measurement,
+//       information);
+
+//   if (!edge) {
+//     RCLCPP_ERROR(this->get_logger(),
+//                  "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+//                  kf_id, zone_rec.zone_id);
+//     return;
+//   }
+
+//   compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+//   zone_edges_[pair_key] = edge;
+
+//   RCLCPP_INFO(this->get_logger(),
+//               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+// }
+void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
+                                                  const ZoneRecord& zone_rec) {
+  if (!keyframe || !keyframe->node) return;
+
+  const int kf_id = static_cast<int>(keyframe->id());
+
+  // Use the keyframe vertex from the CURRENT compressed graph.
+  auto* kf_vertex = dynamic_cast<g2o::VertexSE3*>(
+      compressed_graph->graph->vertex(kf_id));
+  if (!kf_vertex) {
+    RCLCPP_WARN(this->get_logger(),
+                "[S_GRAPHS] Keyframe vertex %d not found in compressed graph",
+                kf_id);
+    return;
+  }
+
+  // Use the zone vertex from the CURRENT compressed graph, or create it.
+  const int zone_vertex_id = 1000000 + zone_rec.zone_id;
+  auto* zone_vertex = dynamic_cast<g2o::VertexZone*>(
+      compressed_graph->graph->vertex(zone_vertex_id));
+
+  if (!zone_vertex) {
+    zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose,
+                                                  zone_rec.zone_id);
+    if (!zone_vertex) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "[S_GRAPHS] Failed to create zone vertex for zone=%d",
+                   zone_rec.zone_id);
+      return;
+    }
+    zone_vertex_ids_in_graph_.insert(zone_vertex_id);
+    RCLCPP_INFO(this->get_logger(),
+                "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+  } else {
+    zone_vertex->setEstimate(zone_rec.centroid_pose);
+  }
+
+  double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+  spread = std::max(spread, 0.5);
+
+  Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+  Eigen::Isometry3d measurement = kf_vertex->estimate().inverse() * zone_vertex->estimate();
+
+  auto* edge = compressed_graph->add_zone_keyframe_edge(
+      kf_vertex,
+      zone_vertex,
+      zone_rec.zone_id,
+      kf_id,
+      measurement,
+      information);
+
+  if (!edge) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+                 kf_id, zone_rec.zone_id);
+    return;
+  }
+
+  compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+
+  RCLCPP_INFO(this->get_logger(),
+              "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+              kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+}
+
+
+
+
+// void SGraphsNode::sync_zone_layer_to_graph() {
+//   RCLCPP_ERROR(this->get_logger(),"CHALLL CHALLL CHALLL CHALLL CHALLL");
+//   for (const auto& kv : keyframes) {
+//     RCLCPP_ERROR(this->get_logger(),"BHAIII KYA HAIII?");
+//     attach_or_update_zone_factor_for_keyframe(kv.second);
+//   }
+//   zones_dirty_ = false;
+// }
+void SGraphsNode::sync_zone_layer_to_graph() {
+  // Snapshot the semantic zones first.
+  std::vector<ZoneRecord> active_zones;
+  {
+    std::lock_guard<std::mutex> zlock(zone_mutex_);
+
+    active_zones.reserve(zone_records_.size());
+    for (const auto& [zone_id, rec] : zone_records_) {
+      if (!rec.valid) continue;
+      active_zones.push_back(rec);
+    }
+  }
+
+  // Always rebuild the zone layer cleanly.
+  clear_zone_layer_from_graph();
+
+  // Recreate the keyframe-to-zone lookup from semantic records.
+  {
+    std::lock_guard<std::mutex> zlock(zone_mutex_);
+    keyframe_to_zone_.clear();
+    for (const auto& rec : active_zones) {
+      for (int kf_id : rec.keyframe_ids) {
+        keyframe_to_zone_[kf_id] = rec.zone_id;
+      }
+    }
+  }
+
+  // Rebuild zones using CURRENT graph-owned keyframe vertices only.
+  for (const auto& zone_rec : active_zones) {
+    for (int kf_id : zone_rec.keyframe_ids) {
+      auto kf_it = keyframes.find(kf_id);
+      if (kf_it == keyframes.end() || !kf_it->second) continue;
+      attach_zone_factor_for_keyframe(kf_it->second, zone_rec);
+    }
+  }
+
+  zones_dirty_ = false;
+  graph_rebuilt_since_last_zone_sync_ = false;
 }
 
 }  // namespace s_graphs

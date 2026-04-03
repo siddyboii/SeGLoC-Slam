@@ -80,6 +80,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #include <s_graphs/visualization/graph_publisher.hpp>
 #include <s_graphs/visualization/graph_visualizer.hpp>
 #include <unordered_map>
+#include "situational_graphs_msgs/msg/zone.hpp"
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -210,6 +211,28 @@ class SGraphsNode : public rclcpp::Node {
       const situational_graphs_msgs::msg::WallsData::SharedPtr walls_msg);
 
  protected:
+    struct ZoneRecord {
+        int zone_id = -1;
+        int floor_id = -1;
+        Eigen::Isometry3d centroid_pose = Eigen::Isometry3d::Identity();
+        std::vector<int> room_ids;
+        std::vector<int> keyframe_ids;
+        std::vector<std::string> top_labels;
+        std::vector<float> top_label_confidences;
+        float confidence = 0.0f;
+        uint64_t version = 0;
+        uint8_t action = 0;
+        bool valid = true;
+    };
+
+  void zone_data_callback(const situational_graphs_msgs::msg::Zone::SharedPtr zone_msg);
+
+  void sync_zone_layer_to_graph();
+
+//   void attach_or_update_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe);
+  void attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,const ZoneRecord& zone_rec);
+
+  void clear_zone_layer_from_graph();
   /**
    * @brief this method adds all the keyframes in #keyframe_queue to the pose graph
    * (odometry edges)
@@ -785,6 +808,7 @@ class SGraphsNode : public rclcpp::Node {
   std::unique_ptr<IMUMapper> imu_mapper;
   std::unique_ptr<GraphPublisher> graph_publisher;
   std::unique_ptr<RoomGraphGenerator> room_graph_generator;
+  int prev_zone_vertex_id = 0;
 
   // Semantic processing members (YOLO + CLIP)
 #ifdef USE_TENSORRT_YOLO
@@ -816,6 +840,7 @@ class SGraphsNode : public rclcpp::Node {
   long processed_count_ = 0;
   std::vector<float> last_embedding_;
   std::mutex keyframe_mutex_;  // Thread-safe keyframe access during semantic processing
+  std::mutex graph_cycle_mutex_;
 
   // Image Quality Assessment (IQA) subscription
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr iqa_score_sub_;
@@ -835,5 +860,24 @@ class SGraphsNode : public rclcpp::Node {
   std::shared_ptr<ZoneCache> zone_cache_;
   bool use_zone_prefilter_ = true;
   double zone_confidence_threshold_ = 0.3;
+
+    // Zone graph integration
+  rclcpp::Subscription<situational_graphs_msgs::msg::Zone>::SharedPtr zone_sub_;
+  std::mutex zone_mutex_;
+  std::unordered_map<int, ZoneRecord> zone_records_;
+  std::unordered_map<int, int> keyframe_to_zone_;
+//   std::unordered_map<int, g2o::VertexZone*> zone_vertices_;
+  std::set<std::pair<int, int>> attached_zone_keyframe_edges_;
+//   std::unordered_map<uint64_t, g2o::EdgeZoneKeyframe*> zone_edges_;
+//   std::unordered_map<uint64_t, uint64_t> zone_edge_versions_;
+  std::set<std::pair<int, int>> attached_zone_floor_edges_;
+  bool zones_dirty_ = false;
+
+  std::unordered_set<int> zone_vertex_ids_in_graph_;
+  bool graph_rebuilt_since_last_zone_sync_ = false;
+
+  // Zone parameters
+//   bool use_zone_prefilter_ = false;
+//   double zone_confidence_threshold_ = 0.3;
 };
 }  // namespace s_graphs
