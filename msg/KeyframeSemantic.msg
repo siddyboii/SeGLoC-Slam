@@ -1,0 +1,11 @@
+std_msgs/Header header
+int32 keyframe_id
+int32 keyframe_seq
+builtin_interfaces/Time stamp
+int32 floor_id
+int32 room_id
+string[] objects
+float32[] object_confidence
+float32 scene_confidence
+string model_name
+geometry_msgs/Pose pose

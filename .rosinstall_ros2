@@ -1,0 +1,29 @@
+repositories:
+  utils/fast_gicp:
+    type: git
+    url: https://github.com/koide3/fast_gicp.git
+    version: master
+  utils/ndt_omp:
+    type: git
+    url: https://github.com/koide3/ndt_omp.git
+    version: master
+  utils/reasoning/situational_graphs_reasoning:
+    type: git
+    url: https://github.com/snt-arg/situational_graphs_reasoning.git
+    version: develop
+  utils/reasoning/situational_graphs_datasets:
+    type: git
+    url: https://github.com/snt-arg/situational_graphs_datasets.git
+    version: develop
+  utils/reasoning/situational_graphs_wrapper:
+    type: git
+    url: https://github.com/snt-arg/situational_graphs_wrapper.git
+    version: develop
+  utils/msgs/situational_graphs_reasoning_msgs:
+    type: git
+    url: https://github.com/snt-arg/situational_graphs_reasoning_msgs.git
+    version: main
+  utils/msgs/situational_graphs_msgs:
+    type: git
+    url: https://github.com/snt-arg/situational_graphs_msgs.git
+    version: main

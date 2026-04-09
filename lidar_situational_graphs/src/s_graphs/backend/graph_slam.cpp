@@ -1,0 +1,1114 @@
+#include <s_graphs/backend/graph_slam.hpp>
+
+G2O_USE_OPTIMIZATION_LIBRARY(pcg)
+G2O_USE_OPTIMIZATION_LIBRARY(cholmod)  // be aware of that cholmod brings GPL dependency
+G2O_USE_OPTIMIZATION_LIBRARY(
+    csparse)  // be aware of that csparse brings LGPL unless it is dynamically linked
+
+namespace g2o {
+G2O_REGISTER_TYPE(EDGE_LOOP_CLOSURE, EdgeLoopClosure)
+G2O_REGISTER_TYPE(EDGE_SE3_PLANE, EdgeSE3Plane)
+G2O_REGISTER_TYPE(EDGE_SE3_POINT_TO_PLANE, EdgeSE3PointToPlane)
+G2O_REGISTER_TYPE(EDGE_SE3_PRIORXY, EdgeSE3PriorXY)
+G2O_REGISTER_TYPE(EDGE_SE3_PRIORXYZ, EdgeSE3PriorXYZ)
+G2O_REGISTER_TYPE(EDGE_SE3_PRIORVEC, EdgeSE3PriorVec)
+G2O_REGISTER_TYPE(EDGE_SE3_PRIORQUAT, EdgeSE3PriorQuat)
+G2O_REGISTER_TYPE(EDGE_PLANE_PRIOR_NORMAL, EdgePlanePriorNormal)
+G2O_REGISTER_TYPE(EDGE_PLANE_PRIOR_DISTANCE, EdgePlanePriorDistance)
+G2O_REGISTER_TYPE(EDGE_PLANE_IDENTITY, EdgePlaneIdentity)
+G2O_REGISTER_TYPE(EDGE_PLANE_PARALLEL, EdgePlaneParallel)
+G2O_REGISTER_TYPE(EDGE_PLANE_PAERPENDICULAR, EdgePlanePerpendicular)
+G2O_REGISTER_TYPE(EDGE_2PLANES, Edge2Planes)
+G2O_REGISTER_TYPE(EDGE_SE3_PLANE_PLANE, EdgeSE3PlanePlane)
+G2O_REGISTER_TYPE(EDGE_SE3_INFINITE_ROOM, EdgeSE3InfiniteRoom)
+G2O_REGISTER_TYPE(EDGE_INFINITE_ROOM_XPLANE, EdgeInfiniteRoomXPlane)
+G2O_REGISTER_TYPE(EDGE_INFINITE_ROOM_YPLANE, EdgeInfiniteRoomYPlane)
+G2O_REGISTER_TYPE(EDGE_SE3_ROOM, EdgeSE3Room)
+G2O_REGISTER_TYPE(EDGE_MULTI_SE3, EdgeMultiSE3)
+G2O_REGISTER_TYPE(EDGE_ROOM_2PLANES, EdgeRoom2Planes)
+G2O_REGISTER_TYPE(EDGE_ROOM_4PLANES, EdgeRoom4Planes)
+G2O_REGISTER_TYPE(EDGE_FLOOR_ROOM, EdgeFloorRoom)
+G2O_REGISTER_TYPE(EDGE_ROOM_ROOM, EdgeRoomRoom)
+G2O_REGISTER_TYPE(EDGE_SE3_ROOM_ROOM, EdgeSE3RoomRoom)
+G2O_REGISTER_TYPE(EDGE_XINFINITE_ROOM_XINFINITE_ROOM, EdgeXInfiniteRoomXInfiniteRoom)
+G2O_REGISTER_TYPE(EDGE_YINFINITE_ROOM_YINFINITE_ROOM, EdgeYInfiniteRoomYInfiniteRoom)
+G2O_REGISTER_TYPE(EDGE_SEMANTIC_CONSISTENCY, EdgeSemanticConsistency)
+G2O_REGISTER_TYPE(VERTEX_ROOM, VertexRoom)
+G2O_REGISTER_TYPE(VERTEX_FLOOR, VertexFloor)
+G2O_REGISTER_TYPE(VERTEX_DEVIATION, VertexDeviation)
+G2O_REGISTER_TYPE(VERTEX_INFINITE_ROOM, VertexInfiniteRoom)
+}  // namespace g2o
+
+namespace s_graphs {
+
+/**
+ * @brief constructor
+ */
+GraphSLAM::GraphSLAM(const std::string& solver_type, bool save_time, bool verbose) {
+  graph.reset(new g2o::SparseOptimizer());
+  g2o::SparseOptimizer* graph = dynamic_cast<g2o::SparseOptimizer*>(this->graph.get());
+
+  if (verbose) {
+    std::cout << "construct solver: " << solver_type << std::endl;
+    g2o::OptimizationAlgorithmFactory* solver_factory =
+        g2o::OptimizationAlgorithmFactory::instance();
+    g2o::OptimizationAlgorithmProperty solver_property;
+    g2o::OptimizationAlgorithm* solver =
+        solver_factory->construct(solver_type, solver_property);
+    graph->setAlgorithm(solver);
+
+    if (!graph->solver()) {
+      std::cerr << std::endl;
+      std::cerr << "error : failed to allocate solver!!" << std::endl;
+      solver_factory->listSolvers(std::cerr);
+      std::cerr << "-------------" << std::endl;
+      std::cin.ignore(1);
+      return;
+    }
+    std::cout << "done" << std::endl;
+  } else {
+    typedef g2o::BlockSolver<g2o::BlockSolverX> BlockSolverType;
+    typedef g2o::LinearSolverCholmod<BlockSolverType::PoseMatrixType> LinearSolverType;
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+        std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
+    graph->setAlgorithm(solver);
+  }
+
+  robust_kernel_factory = g2o::RobustKernelFactory::instance();
+  nbr_of_vertices = nbr_of_edges = 0;
+  timing_counter = 0;
+  sum_prev_timings = 0.0;
+
+  save_compute_time = save_time;
+  if (save_compute_time) {
+    time_recorder.open("/tmp/optimization_computation_time.txt");
+    time_recorder << "#time \n";
+    time_recorder.close();
+  }
+}
+
+/**
+ * @brief destructor
+ */
+GraphSLAM::~GraphSLAM() { graph.reset(); }
+
+void GraphSLAM::select_solver_type(const std::string& solver_type) {
+  g2o::SparseOptimizer* graph = dynamic_cast<g2o::SparseOptimizer*>(this->graph.get());
+
+  std::cout << "construct solver: " << solver_type << std::endl;
+  g2o::OptimizationAlgorithmFactory* solver_factory =
+      g2o::OptimizationAlgorithmFactory::instance();
+  g2o::OptimizationAlgorithmProperty solver_property;
+  g2o::OptimizationAlgorithm* solver =
+      solver_factory->construct(solver_type, solver_property);
+  graph->setAlgorithm(solver);
+
+  if (!graph->solver()) {
+    std::cerr << std::endl;
+    std::cerr << "error : failed to allocate solver!!" << std::endl;
+    solver_factory->listSolvers(std::cerr);
+    std::cerr << "-------------" << std::endl;
+    std::cin.ignore(1);
+    return;
+  }
+  std::cout << "done" << std::endl;
+}
+
+void GraphSLAM::set_total_nbr_of_vertices(const int vertices) {
+  nbr_of_vertices = vertices + 1;
+}
+void GraphSLAM::set_total_nbr_of_edges(const int edges) { nbr_of_edges = edges + 1; }
+
+int GraphSLAM::retrieve_total_nbr_of_vertices() const {
+  return graph->vertices().size();
+}
+
+int GraphSLAM::retrieve_total_nbr_of_edges() const { return graph->edges().size(); }
+
+int GraphSLAM::retrieve_local_nbr_of_vertices() const { return nbr_of_vertices; }
+int GraphSLAM::retrieve_local_nbr_of_edges() const { return nbr_of_edges; }
+
+int GraphSLAM::increment_local_nbr_of_vertices() { return nbr_of_vertices += 1; }
+
+int GraphSLAM::increment_local_nbr_of_edges() { return nbr_of_edges += 1; }
+
+g2o::VertexSE3* GraphSLAM::add_se3_node(const Eigen::Isometry3d& pose,
+                                        bool use_vertex_size_id) {
+  g2o::VertexSE3* vertex(new g2o::VertexSE3());
+  if (!use_vertex_size_id)
+    vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  else
+    vertex->setId(static_cast<int>(retrieve_total_nbr_of_vertices()));
+  vertex->setEstimate(pose);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexSE3* GraphSLAM::copy_se3_node(const g2o::VertexSE3* node) {
+  g2o::VertexSE3* vertex(new g2o::VertexSE3());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexPlane* GraphSLAM::add_plane_node(const Eigen::Vector4d& plane_coeffs) {
+  return add_plane_node(plane_coeffs, retrieve_local_nbr_of_vertices());
+}
+
+g2o::VertexPlane* GraphSLAM::add_plane_node(const Eigen::Vector4d& plane_coeffs,
+                                            const int id) {
+  g2o::VertexPlane* vertex(new g2o::VertexPlane());
+  vertex->setId(id);
+  vertex->setEstimate(plane_coeffs);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexPlane* GraphSLAM::copy_plane_node(const g2o::VertexPlane* node) {
+  g2o::VertexPlane* vertex(new g2o::VertexPlane());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+bool GraphSLAM::remove_plane_node(g2o::VertexPlane* plane_vertex) {
+  return graph->removeVertex(plane_vertex);
+}
+
+bool GraphSLAM::remove_room_node(g2o::VertexRoom* room_vertex) {
+  return graph->removeVertex(room_vertex);
+}
+
+bool GraphSLAM::remove_floor_node(g2o::VertexFloor* floor_vertex) {
+  return graph->removeVertex(floor_vertex);
+}
+
+g2o::VertexPointXYZ* GraphSLAM::add_point_xyz_node(const Eigen::Vector3d& xyz) {
+  g2o::VertexPointXYZ* vertex(new g2o::VertexPointXYZ());
+  vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  vertex->setEstimate(xyz);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexRoom* GraphSLAM::add_room_node(const Eigen::Isometry3d& room_pose) {
+  g2o::VertexRoom* vertex(new g2o::VertexRoom());
+  vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  vertex->setEstimate(room_pose);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexDoorWay* GraphSLAM::add_doorway_node(const Eigen::Isometry3d& doorway_pose) {
+  g2o::VertexDoorWay* vertex(new g2o::VertexDoorWay());
+  vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  vertex->setEstimate(doorway_pose);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexDoorWay* GraphSLAM::copy_doorway_node(const g2o::VertexDoorWay* node) {
+  g2o::VertexDoorWay* vertex(new g2o::VertexDoorWay());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexRoom* GraphSLAM::copy_room_node(const g2o::VertexRoom* node) {
+  g2o::VertexRoom* vertex(new g2o::VertexRoom());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexDeviation* GraphSLAM::copy_deviation_node(const g2o::VertexDeviation* node) {
+  g2o::VertexDeviation* vertex(new g2o::VertexDeviation());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexFloor* GraphSLAM::add_floor_node(const Eigen::Isometry3d& floor_pose,
+                                            const int& id) {
+  g2o::VertexFloor* vertex(new g2o::VertexFloor());
+  if (id == -1) {
+    vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+    this->increment_local_nbr_of_vertices();
+  } else
+    vertex->setId(id);
+  vertex->setEstimate(floor_pose);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexFloor* GraphSLAM::copy_floor_node(const g2o::VertexFloor* node) {
+  g2o::VertexFloor* vertex(new g2o::VertexFloor());
+  vertex->setId(node->id());
+  vertex->setEstimate(node->estimate());
+  if (node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+void GraphSLAM::update_floor_node(g2o::VertexFloor* floor_node,
+                                  const Eigen::Isometry3d& floor_pose) {
+  floor_node->setEstimate(floor_pose);
+
+  return;
+}
+
+g2o::VertexWall* GraphSLAM::add_wall_node(const Eigen::Vector3d& wall_center) {
+  g2o::VertexWall* vertex(new g2o::VertexWall());
+  vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  vertex->setEstimate(wall_center);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+
+  return vertex;
+}
+
+g2o::VertexWall* GraphSLAM::copy_wall_node(const g2o::VertexWall* wall_node) {
+  g2o::VertexWall* vertex(new g2o::VertexWall());
+  vertex->setId(wall_node->id());
+  vertex->setEstimate(wall_node->estimate());
+  if (wall_node->fixed()) vertex->setFixed(true);
+  graph->addVertex(vertex);
+
+  return vertex;
+}
+
+g2o::VertexDeviation* GraphSLAM::add_deviation_node(const Eigen::Isometry3d& pose) {
+  g2o::VertexDeviation* vertex(new g2o::VertexDeviation());
+  vertex->setId(static_cast<int>(retrieve_local_nbr_of_vertices()));
+  vertex->setEstimate(pose);
+  graph->addVertex(vertex);
+  this->increment_local_nbr_of_vertices();
+  return vertex;
+}
+
+g2o::EdgeSE3* GraphSLAM::add_se3_edge(g2o::VertexSE3* v1,
+                                      g2o::VertexSE3* v2,
+                                      const Eigen::Isometry3d& relative_pose,
+                                      const Eigen::MatrixXd& information_matrix,
+                                      const bool use_edge_size_id) {
+  g2o::EdgeSE3* edge(new g2o::EdgeSE3());
+  if (use_edge_size_id)
+    edge->setId(static_cast<int>(retrieve_total_nbr_of_edges()));
+  else
+    edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(relative_pose);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeLoopClosure* GraphSLAM::add_loop_closure_edge(
+    g2o::VertexSE3* v1,
+    g2o::VertexSE3* v2,
+    const Eigen::Isometry3d& relative_pose,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeLoopClosure* edge(new g2o::EdgeLoopClosure());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(relative_pose);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSemanticConsistency* GraphSLAM::add_semantic_consistency_edge(
+    g2o::VertexSE3* v1,
+    g2o::VertexSE3* v2,
+    double gnn_similarity,
+    double info_weight,
+    double max_dist,
+    double gamma) {
+  // Convert similarity to expected distance
+  double expected_dist =
+      g2o::EdgeSemanticConsistency::similarityToDistance(gnn_similarity, max_dist, gamma);
+
+  // Compute information weight (higher sim → tighter constraint)
+  double info_value =
+      g2o::EdgeSemanticConsistency::similarityToInformation(gnn_similarity, info_weight);
+
+  g2o::EdgeSemanticConsistency* edge(new g2o::EdgeSemanticConsistency());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(expected_dist);
+  edge->setGNNSimilarity(gnn_similarity);
+
+  Eigen::Matrix<double, 1, 1> info;
+  info(0, 0) = info_value;
+  edge->setInformation(info);
+
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3* GraphSLAM::copy_se3_edge(g2o::EdgeSE3* e,
+                                       g2o::VertexSE3* v1,
+                                       g2o::VertexSE3* v2) {
+  g2o::EdgeSE3* edge(new g2o::EdgeSE3());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSE3Plane* GraphSLAM::add_se3_plane_edge(
+    g2o::VertexSE3* v_se3,
+    g2o::VertexPlane* v_plane,
+    const Eigen::Vector4d& plane_coeffs,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3Plane* edge(new g2o::EdgeSE3Plane());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(plane_coeffs);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_plane;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3* GraphSLAM::copy_loop_closure_edge(g2o::EdgeLoopClosure* e,
+                                                g2o::VertexSE3* v1,
+                                                g2o::VertexSE3* v2) {
+  g2o::EdgeLoopClosure* edge(new g2o::EdgeLoopClosure());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSemanticConsistency* GraphSLAM::copy_semantic_consistency_edge(
+    g2o::EdgeSemanticConsistency* e,
+    g2o::VertexSE3* v1,
+    g2o::VertexSE3* v2) {
+  g2o::EdgeSemanticConsistency* edge(new g2o::EdgeSemanticConsistency());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->setGNNSimilarity(e->gnnSimilarity());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSE3Plane* GraphSLAM::copy_se3_plane_edge(g2o::EdgeSE3Plane* e,
+                                                  g2o::VertexSE3* v1,
+                                                  g2o::VertexPlane* v2) {
+  g2o::EdgeSE3Plane* edge(new g2o::EdgeSE3Plane());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+bool GraphSLAM::remove_se3_plane_edge(g2o::EdgeSE3Plane* se3_plane_edge) {
+  bool ack = graph->removeEdge(se3_plane_edge);
+
+  return ack;
+}
+
+bool GraphSLAM::remove_loop_closure_edge(g2o::EdgeLoopClosure* edge) {
+  bool ack = graph->removeEdge(edge);
+  return ack;
+}
+
+void GraphSLAM::update_se3edge_information(g2o::EdgeSE3* edge_se3,
+                                           Eigen::MatrixXd information_matrix) {
+  edge_se3->setInformation(information_matrix);
+}
+
+g2o::EdgeSE3PointToPlane* GraphSLAM::add_se3_point_to_plane_edge(
+    g2o::VertexSE3* v_se3,
+    g2o::VertexPlane* v_plane,
+    const Eigen::Matrix4d& points_matrix,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3PointToPlane* edge(new g2o::EdgeSE3PointToPlane());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(points_matrix);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_plane;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PointXYZ* GraphSLAM::add_se3_point_xyz_edge(
+    g2o::VertexSE3* v_se3,
+    g2o::VertexPointXYZ* v_xyz,
+    const Eigen::Vector3d& xyz,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3PointXYZ* edge(new g2o::EdgeSE3PointXYZ());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(xyz);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_xyz;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgePlanePriorNormal* GraphSLAM::add_plane_normal_prior_edge(
+    g2o::VertexPlane* v,
+    const Eigen::Vector3d& normal,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgePlanePriorNormal* edge(new g2o::EdgePlanePriorNormal());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(normal);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgePlanePriorDistance* GraphSLAM::add_plane_distance_prior_edge(
+    g2o::VertexPlane* v,
+    double distance,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgePlanePriorDistance* edge(new g2o::EdgePlanePriorDistance());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(distance);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PriorXY* GraphSLAM::add_se3_prior_xy_edge(
+    g2o::VertexSE3* v_se3,
+    const Eigen::Vector2d& xy,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3PriorXY* edge(new g2o::EdgeSE3PriorXY());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(xy);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PriorXYZ* GraphSLAM::add_se3_prior_xyz_edge(
+    g2o::VertexSE3* v_se3,
+    const Eigen::Vector3d& xyz,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3PriorXYZ* edge(new g2o::EdgeSE3PriorXYZ());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(xyz);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PriorVec* GraphSLAM::add_se3_prior_vec_edge(
+    g2o::VertexSE3* v_se3,
+    const Eigen::Vector3d& direction,
+    const Eigen::Vector3d& measurement,
+    const Eigen::MatrixXd& information_matrix) {
+  Eigen::Matrix<double, 6, 1> m;
+  m.head<3>() = direction;
+  m.tail<3>() = measurement;
+
+  g2o::EdgeSE3PriorVec* edge(new g2o::EdgeSE3PriorVec());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(m);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PriorQuat* GraphSLAM::add_se3_prior_quat_edge(
+    g2o::VertexSE3* v_se3,
+    const Eigen::Quaterniond& quat,
+    const Eigen::MatrixXd& information_matrix) {
+  g2o::EdgeSE3PriorQuat* edge(new g2o::EdgeSE3PriorQuat());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(quat);
+  edge->setInformation(information_matrix);
+  edge->vertices()[0] = v_se3;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PriorQuat* GraphSLAM::copy_se3_prior_quat_edge(g2o::EdgeSE3PriorQuat* e,
+                                                           g2o::VertexSE3* v_se3) {
+  g2o::EdgeSE3PriorQuat* edge(new g2o::EdgeSE3PriorQuat());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v_se3;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgePlane* GraphSLAM::add_plane_edge(g2o::VertexPlane* v_plane1,
+                                          g2o::VertexPlane* v_plane2,
+                                          const Eigen::Vector4d& measurement,
+                                          const Eigen::Matrix4d& information) {
+  g2o::EdgePlane* edge(new g2o::EdgePlane());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_plane1;
+  edge->vertices()[1] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgePlaneIdentity* GraphSLAM::add_plane_identity_edge(
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    const Eigen::Vector4d& measurement,
+    const Eigen::Matrix4d& information) {
+  g2o::EdgePlaneIdentity* edge(new g2o::EdgePlaneIdentity());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_plane1;
+  edge->vertices()[1] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgePlaneParallel* GraphSLAM::add_plane_parallel_edge(
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    const Eigen::Vector3d& measurement,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgePlaneParallel* edge(new g2o::EdgePlaneParallel());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_plane1;
+  edge->vertices()[1] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgePlanePerpendicular* GraphSLAM::add_plane_perpendicular_edge(
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    const Eigen::Vector3d& measurement,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgePlanePerpendicular* edge(new g2o::EdgePlanePerpendicular());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_plane1;
+  edge->vertices()[1] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::Edge2Planes* GraphSLAM::add_2planes_edge(g2o::VertexPlane* v_plane1,
+                                              g2o::VertexPlane* v_plane2,
+                                              const Eigen::MatrixXd& information) {
+  g2o::Edge2Planes* edge(new g2o::Edge2Planes());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_plane1;
+  edge->vertices()[1] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::Edge2Planes* GraphSLAM::copy_2planes_edge(g2o::Edge2Planes* e,
+                                               g2o::VertexPlane* v1,
+                                               g2o::VertexPlane* v2) {
+  g2o::Edge2Planes* edge(new g2o::Edge2Planes());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeWall2Planes* GraphSLAM::copy_wall_2planes_edge(g2o::EdgeWall2Planes* e,
+                                                        g2o::VertexWall* v1,
+                                                        g2o::VertexPlane* v2,
+                                                        g2o::VertexPlane* v3) {
+  g2o::EdgeWall2Planes* edge(new g2o::EdgeWall2Planes(e->get_wall_point()));
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSE3PlanePlane* GraphSLAM::add_se3_2planes_edge(
+    g2o::VertexDeviation* v_se3,
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeSE3PlanePlane* edge(new g2o::EdgeSE3PlanePlane());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_plane1;
+  edge->vertices()[2] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3PlanePlane* GraphSLAM::copy_se3_2planes_edge(g2o::EdgeSE3PlanePlane* e,
+                                                         g2o::VertexDeviation* v_se3,
+                                                         g2o::VertexPlane* v_plane1,
+                                                         g2o::VertexPlane* v_plane2) {
+  g2o::EdgeSE3PlanePlane* edge(new g2o::EdgeSE3PlanePlane());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_plane1;
+  edge->vertices()[2] = v_plane2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSE3Room* GraphSLAM::add_se3_room_edge(g2o::VertexSE3* v_se3,
+                                               g2o::VertexRoom* v_room,
+                                               const Eigen::Isometry3d& measurement,
+                                               const Eigen::MatrixXd& information) {
+  g2o::EdgeSE3Room* edge(new g2o::EdgeSE3Room());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_se3;
+  edge->vertices()[1] = v_room;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeMultiSE3* GraphSLAM::add_origin_to_origin_edge(
+    g2o::VertexSE3* v_a_graph_origin,
+    g2o::VertexSE3* v_s_graph_origin,
+    g2o::VertexSE3* v_transformation,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeMultiSE3* edge(new g2o::EdgeMultiSE3());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_a_graph_origin;
+  edge->vertices()[1] = v_s_graph_origin;
+  edge->vertices()[2] = v_transformation;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeRoom2Planes* GraphSLAM::add_room_2planes_edge(
+    g2o::VertexRoom* v_room,
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    g2o::VertexRoom* v_cluster_center,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeRoom2Planes* edge(new g2o::EdgeRoom2Planes());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_room;
+  edge->vertices()[1] = v_plane1;
+  edge->vertices()[2] = v_plane2;
+  edge->vertices()[3] = v_cluster_center;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeWall2Planes* GraphSLAM::add_wall_2planes_edge(
+    g2o::VertexWall* v_wall,
+    g2o::VertexPlane* v_plane1,
+    g2o::VertexPlane* v_plane2,
+    Eigen::Vector3d wall_point,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeWall2Planes* edge(new g2o::EdgeWall2Planes(wall_point));
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_wall;
+  edge->vertices()[1] = v_plane1;
+  edge->vertices()[2] = v_plane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeDoorWay2Rooms* GraphSLAM::add_doorway_2rooms_edge(
+    g2o::VertexDoorWay* v_door_r1,
+    g2o::VertexDoorWay* v_door_r2,
+    g2o::VertexRoom* v_room1,
+    g2o::VertexRoom* v_room2,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeDoorWay2Rooms* edge(new g2o::EdgeDoorWay2Rooms());
+  edge->setInformation(information);
+  edge->vertices()[0] = v_door_r1;
+  edge->vertices()[1] = v_door_r2;
+  edge->vertices()[2] = v_room1;
+  edge->vertices()[3] = v_room2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+bool GraphSLAM::remove_room_2planes_edge(g2o::EdgeRoom2Planes* room_plane_edge) {
+  bool ack = graph->removeEdge(room_plane_edge);
+
+  return ack;
+}
+
+g2o::EdgeRoom2Planes* GraphSLAM::copy_room_2planes_edge(g2o::EdgeRoom2Planes* e,
+                                                        g2o::VertexRoom* v1,
+                                                        g2o::VertexPlane* v2,
+                                                        g2o::VertexPlane* v3,
+                                                        g2o::VertexRoom* v4) {
+  g2o::EdgeRoom2Planes* edge(new g2o::EdgeRoom2Planes());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  edge->vertices()[3] = v4;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeRoom4Planes* GraphSLAM::add_room_4planes_edge(
+    g2o::VertexRoom* v_room,
+    g2o::VertexPlane* v_xplane1,
+    g2o::VertexPlane* v_xplane2,
+    g2o::VertexPlane* v_yplane1,
+    g2o::VertexPlane* v_yplane2,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeRoom4Planes* edge(new g2o::EdgeRoom4Planes());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v_room;
+  edge->vertices()[1] = v_xplane1;
+  edge->vertices()[2] = v_xplane2;
+  edge->vertices()[3] = v_yplane1;
+  edge->vertices()[4] = v_yplane2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeSE3RoomRoom* GraphSLAM::add_deviation_two_rooms_edge(
+    g2o::VertexDeviation* v1,
+    g2o::VertexRoom* v2,
+    g2o::VertexRoom* v3,
+    const Eigen::MatrixXd& information) {
+  g2o::EdgeSE3RoomRoom* edge(new g2o::EdgeSE3RoomRoom());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  std::cout << "Information Set !" << std::endl;
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+  std::cout << "edge added !" << std::endl;
+  return edge;
+}
+
+g2o::EdgeDoorWay2Rooms* GraphSLAM::copy_doorway_2rooms_edge(g2o::EdgeDoorWay2Rooms* e,
+                                                            g2o::VertexDoorWay* v1,
+                                                            g2o::VertexDoorWay* v2,
+                                                            g2o::VertexRoom* v3,
+                                                            g2o::VertexRoom* v4) {
+  g2o::EdgeDoorWay2Rooms* edge(new g2o::EdgeDoorWay2Rooms());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  edge->vertices()[3] = v4;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeSE3RoomRoom* GraphSLAM::copy_se3_2rooms_edge(g2o::EdgeSE3RoomRoom* e,
+                                                      g2o::VertexDeviation* v1,
+                                                      g2o::VertexRoom* v2,
+                                                      g2o::VertexRoom* v3) {
+  g2o::EdgeSE3RoomRoom* edge(new g2o::EdgeSE3RoomRoom());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::Edge2Rooms* GraphSLAM::add_2rooms_edge(g2o::VertexRoom* v1,
+                                            g2o::VertexRoom* v2,
+                                            const Eigen::MatrixXd& information) {
+  g2o::Edge2Rooms* edge(new g2o::Edge2Rooms());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setInformation(information);
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+  return edge;
+}
+
+g2o::EdgeRoom4Planes* GraphSLAM::copy_room_4planes_edge(g2o::EdgeRoom4Planes* e,
+                                                        g2o::VertexRoom* v1,
+                                                        g2o::VertexPlane* v2,
+                                                        g2o::VertexPlane* v3,
+                                                        g2o::VertexPlane* v4,
+                                                        g2o::VertexPlane* v5) {
+  g2o::EdgeRoom4Planes* edge(new g2o::EdgeRoom4Planes());
+  edge->setId(e->id());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  edge->vertices()[2] = v3;
+  edge->vertices()[3] = v4;
+  edge->vertices()[4] = v5;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+g2o::EdgeFloorRoom* GraphSLAM::add_floor_room_edge(g2o::VertexFloor* v_floor,
+                                                   g2o::VertexRoom* v_room,
+                                                   const Eigen::Vector3d& measurement,
+                                                   const Eigen::MatrixXd& information) {
+  g2o::EdgeFloorRoom* edge(new g2o::EdgeFloorRoom());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+  edge->vertices()[0] = v_floor;
+  edge->vertices()[1] = v_room;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
+g2o::EdgeFloorRoom* GraphSLAM::copy_floor_room_edge(g2o::EdgeFloorRoom* e,
+                                                    g2o::VertexFloor* v1,
+                                                    g2o::VertexRoom* v2) {
+  g2o::EdgeFloorRoom* edge(new g2o::EdgeFloorRoom());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
+bool GraphSLAM::remove_room_room_edge(g2o::EdgeFloorRoom* room_room_edge) {
+  bool ack = graph->removeEdge(room_room_edge);
+
+  return ack;
+}
+
+void GraphSLAM::add_robust_kernel(g2o::HyperGraph::Edge* edge,
+                                  const std::string& kernel_type,
+                                  double kernel_size) {
+  if (kernel_type == "NONE") {
+    return;
+  }
+
+  g2o::RobustKernel* kernel = robust_kernel_factory->construct(kernel_type);
+  if (kernel == nullptr) {
+    std::cerr << "warning : invalid robust kernel type: " << kernel_type << std::endl;
+    return;
+  }
+
+  kernel->setDelta(kernel_size);
+
+  g2o::OptimizableGraph::Edge* edge_ = dynamic_cast<g2o::OptimizableGraph::Edge*>(edge);
+  edge_->setRobustKernel(kernel);
+}
+
+int GraphSLAM::optimize(const std::string optimization_type, const int num_iterations) {
+  g2o::SparseOptimizer* graph = dynamic_cast<g2o::SparseOptimizer*>(this->graph.get());
+  if (graph->edges().size() < 10) {
+    return -1;
+  }
+
+  std::cout << std::endl;
+  std::cout << "--- " << optimization_type << " graph optimization ---" << std::endl;
+  std::cout << "nodes: " << graph->vertices().size()
+            << "   edges: " << graph->edges().size() << std::endl;
+  std::cout << "optimizing... " << std::flush;
+
+  std::cout << "init" << std::endl;
+  graph->initializeOptimization();
+  graph->setVerbose(false);
+
+  double chi2 = graph->chi2();
+  if (std::isnan(graph->chi2())) {
+    std::cout << "GRAPH RETURNED A NAN WAITING AFTER OPTIMIZATION" << std::endl;
+  }
+
+  std::cout << "optimize!!" << std::endl;
+  auto t1 = rclcpp::Clock{}.now();
+  int iterations = graph->optimize(num_iterations);
+  auto t2 = rclcpp::Clock{}.now();
+  std::cout << "done" << std::endl;
+  std::cout << "iterations: " << iterations << " / " << num_iterations << std::endl;
+  std::cout << "chi2: (before)" << chi2 << " -> (after)" << graph->chi2() << std::endl;
+  std::cout << "time: " << boost::format("%.3f") % (t2 - t1).seconds() << "[sec]"
+            << std::endl;
+  timing_counter++;
+  sum_prev_timings += (t2 - t1).seconds();
+  std::cout << "avg Computation Time: "
+            << boost::format("%.3f") % (sum_prev_timings / timing_counter) << "[sec]"
+            << std::endl;
+
+  if (save_compute_time) {
+    time_recorder.open("/tmp/optimization_computation_time.txt",
+                       std::ofstream::out | std::ofstream::app);
+    time_recorder << std::to_string((t2 - t1).seconds()) + " \n";
+    time_recorder.close();
+  }
+
+  if (std::isnan(graph->chi2())) {
+    throw std::invalid_argument("GRAPH RETURNED A NAN...STOPPING THE EXPERIMENT");
+  }
+
+  return iterations;
+}
+
+bool GraphSLAM::compute_landmark_marginals(
+    g2o::SparseBlockMatrix<Eigen::MatrixXd>& spinv,
+    std::vector<std::pair<int, int>> vert_pairs_vec) {
+  if (graph->computeMarginals(spinv, vert_pairs_vec)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void GraphSLAM::save(const std::string& filename) {
+  g2o::SparseOptimizer* graph = dynamic_cast<g2o::SparseOptimizer*>(this->graph.get());
+
+  std::ofstream ofs(filename);
+  graph->save(ofs);
+
+  g2o::save_robust_kernels(filename + ".kernels", graph);
+}
+
+bool GraphSLAM::load(const std::string& filename) {
+  std::cout << "loading pose graph..." << std::endl;
+  g2o::SparseOptimizer* graph = dynamic_cast<g2o::SparseOptimizer*>(this->graph.get());
+
+  std::ifstream ifs(filename);
+  if (!graph->load(ifs)) {
+    return false;
+  }
+
+  std::cout << "nodes  : " << graph->vertices().size() << std::endl;
+  std::cout << "edges  : " << graph->edges().size() << std::endl;
+
+  if (!g2o::load_robust_kernels(filename + ".kernels", graph)) {
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace s_graphs

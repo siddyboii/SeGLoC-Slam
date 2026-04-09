@@ -1,0 +1,4 @@
+input_dim 517
+hidden_dim 128
+output_dim 128
+heads 4

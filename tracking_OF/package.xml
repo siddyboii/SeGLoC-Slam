@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tracking_of</name>
+  <version>0.0.1</version>
+  <description>3D Point Cloud to 2.5D Grid Map Conversion with Optical Flow Tracking</description>
+  <maintainer email="subhanshu@example.com">Subhanshu</maintainer>
+  <license>Apache License 2.0</license>
+
+  <author email="subhanshu@example.com">Subhanshu</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Core ROS2 Dependencies -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  
+  <!-- Point Cloud Processing -->
+  <depend>pcl_ros</depend>
+  <depend>pcl_conversions</depend>
+  
+  <!-- Computer Vision -->
+  <depend>cv_bridge</depend>
+  <depend>opencv4</depend>
+
+  <!-- S-Graphs message types -->
+  <depend>situational_graphs_msgs</depend>
+
+  <!-- Testing -->
+  <!-- Removed ament_lint_auto as it's optional and may not be installed -->
+</package>
