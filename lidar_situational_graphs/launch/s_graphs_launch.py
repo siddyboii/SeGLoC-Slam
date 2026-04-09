@@ -291,18 +291,18 @@ def launch_sgraphs(context, *args, **kwargs):
         shell=False,
     )
 
-    # DynaTrack: BEV optical flow dynamic object detection
-    dynatrack_cmd = Node(
-        package="tracking_of",
-        executable="of_track_node",
-        namespace=namespace_arg,
-        parameters=[{"use_sim_time": use_sim_time_arg == "true"}],
-        remappings=[
-            ("/velodyne_points", ns_prefix + "filtered_points"),
-            ("/odom", odom_topic_arg),
-        ],
-        output="screen",
-    )
+    # DynaTrack: BEV optical flow dynamic object detection (DISABLED - package not installed)
+    # dynatrack_cmd = Node(
+    #     package="tracking_of",
+    #     executable="of_track_node",
+    #     namespace=namespace_arg,
+    #     parameters=[{"use_sim_time": use_sim_time_arg == "true"}],
+    #     remappings=[
+    #         ("/velodyne_points", ns_prefix + "filtered_points"),
+    #         ("/odom", odom_topic_arg),
+    #     ],
+    #     output="screen",
+    # )
 
     # Zone-based semantic prefiltering node
     zones_script_path = os.path.join(
@@ -329,8 +329,8 @@ def launch_sgraphs(context, *args, **kwargs):
         room_segmentation_cmd if room_segmentation_arg == "old" else reasoning_launch,
         floor_plan_cmd,
         s_graphs_cmd,
-        iqa_cmd,
-        dynatrack_cmd,
-        zones_cmd,
+        # iqa_cmd,
+        # dynatrack_cmd,
+        # zones_cmd,
         metrics_cmd,
     ]

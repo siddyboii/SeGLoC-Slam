@@ -400,7 +400,6 @@ bool InfiniteRoomMapper::insert_infinite_room(
     det_infinite_room.plane2_node = (plane2).plane_node;
     det_infinite_room.local_graph = std::make_shared<GraphSLAM>();
     det_infinite_room.floor_level = (plane1).floor_level;
-    std::cout << "If infinite found room with room id  " << det_infinite_room.id << std::endl;
 
     shared_graph_mutex.lock();
     infinite_rooms.insert({det_infinite_room.id, det_infinite_room});

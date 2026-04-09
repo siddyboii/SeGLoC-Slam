@@ -39,11 +39,17 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory("lidar_situational_graphs")
     main_launch = os.path.join(pkg_dir, "launch", "s_graphs_launch.py")
 
-    # ── Static TF: base_link → PandarXT-32 (LiDAR) ──
-    # The Hesai PandarXT-32 is mounted at the top of the HILTI handheld unit.
-    # Approximate transform from base_link (center of device) to LiDAR.
-    # x=0, y=0, z=0.05m (slightly above), no rotation (both look forward).
-    # Adjust these values if you have the exact HILTI calibration file.
+    # ── Declare launch arguments with HILTI defaults ──
+    declare_lidar_topic = DeclareLaunchArgument(
+        "lidar_topic", default_value="/hesai/pandar")
+    declare_imu_topic = DeclareLaunchArgument(
+        "imu_topic", default_value="/alphasense/imu")
+    declare_compute_odom = DeclareLaunchArgument(
+        "compute_odom", default_value="true")
+    declare_use_sim_time = DeclareLaunchArgument(
+        "use_sim_time", default_value="true")
+
+    # ── Static TF: base_link → LiDAR ──
     lidar_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -60,9 +66,7 @@ def generate_launch_description():
         parameters=[{"use_sim_time": True}],
     )
 
-    # ── Static TF: base_link → imu_sensor_frame (IMU) ──
-    # The Alphasense IMU is co-located with the LiDAR on the handheld unit.
-    # Approximately identity transform (adjust if you have exact calibration).
+    # ── Static TF: base_link → IMU ──
     imu_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -79,10 +83,7 @@ def generate_launch_description():
         parameters=[{"use_sim_time": True}],
     )
 
-    # ── Static TF: base_link → cam0_sensor_frame (Camera 0) ──
-    # Camera 0 on the Alphasense unit. The cameras are arranged around
-    # the unit. cam0 is typically the forward-looking camera.
-    # Approximate values — adjust based on actual HILTI calibration.
+    # ── Static TF: base_link → Camera ──
     cam0_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -94,33 +95,39 @@ def generate_launch_description():
             "--pitch", "0.0",
             "--yaw", "0.0",
             "--frame-id", "base_link",
-            "--child-frame-id", "cam0_sensor_frame",
+            "--child-frame-id", "cam1_sensor_frame",
         ],
         parameters=[{"use_sim_time": True}],
     )
 
-    # ── Include the main s_graphs launch with HILTI-specific topic remaps ──
+    # ── Include the main s_graphs launch — pass through CLI args ──
     s_graphs_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(main_launch),
         launch_arguments={
-            "lidar_topic": "/hesai/pandar",
-            "imu_topic": "/alphasense/imu",
+            "lidar_topic": LaunchConfiguration("lidar_topic"),
+            "imu_topic": LaunchConfiguration("imu_topic"),
             "base_frame": "base_link",
             "odom_frame": "odom",
             "map_frame": "map",
-            "compute_odom": "true",
-            "use_sim_time": "true",
+            "compute_odom": LaunchConfiguration("compute_odom"),
+            "use_sim_time": LaunchConfiguration("use_sim_time"),
             "keyframe_delta": "2.0",
         }.items(),
     )
 
     return LaunchDescription(
         [
-            # Static transforms first
+            # Declare arguments
+            declare_lidar_topic,
+            declare_imu_topic,
+            declare_compute_odom,
+            declare_use_sim_time,
+            # Static transforms
             lidar_tf,
             imu_tf,
             cam0_tf,
-            # Then the full pipeline
+            # Full pipeline
             s_graphs_launch,
         ]
     )
+

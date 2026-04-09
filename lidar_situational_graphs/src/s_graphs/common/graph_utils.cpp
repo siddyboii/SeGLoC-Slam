@@ -256,6 +256,24 @@ std::vector<g2o::VertexSE3*> GraphUtils::copy_graph_edges(
                      boost::bind(&g2o::HyperGraph::Edge::id, _1) == e->id());
     if (found_edge != compressed_graph->graph->edges().end()) continue;
 
+    // Handle semantic consistency edges (must be before EdgeSE3 since it
+    // doesn't inherit from EdgeSE3)
+    g2o::EdgeSemanticConsistency* edge_semantic =
+        dynamic_cast<g2o::EdgeSemanticConsistency*>(e);
+    if (edge_semantic) {
+      if (!compressed_graph->graph->vertex(edge_semantic->vertices()[0]->id()) ||
+          !compressed_graph->graph->vertex(edge_semantic->vertices()[1]->id())) {
+        continue;
+      }
+      g2o::VertexSE3* v1 = dynamic_cast<g2o::VertexSE3*>(
+          compressed_graph->graph->vertices().at(edge_semantic->vertices()[0]->id()));
+      g2o::VertexSE3* v2 = dynamic_cast<g2o::VertexSE3*>(
+          compressed_graph->graph->vertices().at(edge_semantic->vertices()[1]->id()));
+      auto edge = compressed_graph->copy_semantic_consistency_edge(edge_semantic, v1, v2);
+      compressed_graph->add_robust_kernel(edge, "Huber", 2.0);
+      continue;
+    }
+
     g2o::EdgeSE3* edge_se3 = dynamic_cast<g2o::EdgeSE3*>(e);
     if (edge_se3) {
       // first check if they are stair keyframes
@@ -660,6 +678,22 @@ std::vector<g2o::VertexSE3*> GraphUtils::connect_keyframes(
               edge_se3_prior_quat->vertices()[0]->id()));
       auto edge = compressed_graph->copy_se3_prior_quat_edge(edge_se3_prior_quat, v1);
       compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+      continue;
+    }
+
+    // Handle semantic consistency edges in windowed optimization
+    g2o::EdgeSemanticConsistency* edge_semantic =
+        dynamic_cast<g2o::EdgeSemanticConsistency*>(e);
+    if (edge_semantic) {
+      if (compressed_graph->graph->vertex(edge_semantic->vertices()[0]->id()) &&
+          compressed_graph->graph->vertex(edge_semantic->vertices()[1]->id())) {
+        g2o::VertexSE3* v1 = dynamic_cast<g2o::VertexSE3*>(
+            compressed_graph->graph->vertices().at(edge_semantic->vertices()[0]->id()));
+        g2o::VertexSE3* v2 = dynamic_cast<g2o::VertexSE3*>(
+            compressed_graph->graph->vertices().at(edge_semantic->vertices()[1]->id()));
+        auto edge = compressed_graph->copy_semantic_consistency_edge(edge_semantic, v1, v2);
+        compressed_graph->add_robust_kernel(edge, "Huber", 2.0);
+      }
       continue;
     }
 

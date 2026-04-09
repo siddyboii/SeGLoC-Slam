@@ -32,6 +32,7 @@ G2O_REGISTER_TYPE(EDGE_ROOM_ROOM, EdgeRoomRoom)
 G2O_REGISTER_TYPE(EDGE_SE3_ROOM_ROOM, EdgeSE3RoomRoom)
 G2O_REGISTER_TYPE(EDGE_XINFINITE_ROOM_XINFINITE_ROOM, EdgeXInfiniteRoomXInfiniteRoom)
 G2O_REGISTER_TYPE(EDGE_YINFINITE_ROOM_YINFINITE_ROOM, EdgeYInfiniteRoomYInfiniteRoom)
+G2O_REGISTER_TYPE(EDGE_SEMANTIC_CONSISTENCY, EdgeSemanticConsistency)
 G2O_REGISTER_TYPE(VERTEX_ROOM, VertexRoom)
 G2O_REGISTER_TYPE(VERTEX_FLOOR, VertexFloor)
 G2O_REGISTER_TYPE(VERTEX_DEVIATION, VertexDeviation)
@@ -523,6 +524,38 @@ g2o::EdgeLoopClosure* GraphSLAM::add_loop_closure_edge(
   return edge;
 }
 
+g2o::EdgeSemanticConsistency* GraphSLAM::add_semantic_consistency_edge(
+    g2o::VertexSE3* v1,
+    g2o::VertexSE3* v2,
+    double gnn_similarity,
+    double info_weight,
+    double max_dist,
+    double gamma) {
+  // Convert similarity to expected distance
+  double expected_dist =
+      g2o::EdgeSemanticConsistency::similarityToDistance(gnn_similarity, max_dist, gamma);
+
+  // Compute information weight (higher sim → tighter constraint)
+  double info_value =
+      g2o::EdgeSemanticConsistency::similarityToInformation(gnn_similarity, info_weight);
+
+  g2o::EdgeSemanticConsistency* edge(new g2o::EdgeSemanticConsistency());
+  edge->setId(static_cast<int>(retrieve_local_nbr_of_edges()));
+  edge->setMeasurement(expected_dist);
+  edge->setGNNSimilarity(gnn_similarity);
+
+  Eigen::Matrix<double, 1, 1> info;
+  info(0, 0) = info_value;
+  edge->setInformation(info);
+
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+  this->increment_local_nbr_of_edges();
+
+  return edge;
+}
+
 g2o::EdgeSE3* GraphSLAM::copy_se3_edge(g2o::EdgeSE3* e,
                                        g2o::VertexSE3* v1,
                                        g2o::VertexSE3* v2) {
@@ -568,6 +601,22 @@ g2o::EdgeSE3* GraphSLAM::copy_loop_closure_edge(g2o::EdgeLoopClosure* e,
   return edge;
 }
 
+g2o::EdgeSemanticConsistency* GraphSLAM::copy_semantic_consistency_edge(
+    g2o::EdgeSemanticConsistency* e,
+    g2o::VertexSE3* v1,
+    g2o::VertexSE3* v2) {
+  g2o::EdgeSemanticConsistency* edge(new g2o::EdgeSemanticConsistency());
+  edge->setId(e->id());
+  edge->setMeasurement(e->measurement());
+  edge->setInformation(e->information());
+  edge->setGNNSimilarity(e->gnnSimilarity());
+  edge->vertices()[0] = v1;
+  edge->vertices()[1] = v2;
+  graph->addEdge(edge);
+
+  return edge;
+}
+
 g2o::EdgeSE3Plane* GraphSLAM::copy_se3_plane_edge(g2o::EdgeSE3Plane* e,
                                                   g2o::VertexSE3* v1,
                                                   g2o::VertexPlane* v2) {
@@ -585,6 +634,11 @@ g2o::EdgeSE3Plane* GraphSLAM::copy_se3_plane_edge(g2o::EdgeSE3Plane* e,
 bool GraphSLAM::remove_se3_plane_edge(g2o::EdgeSE3Plane* se3_plane_edge) {
   bool ack = graph->removeEdge(se3_plane_edge);
 
+  return ack;
+}
+
+bool GraphSLAM::remove_loop_closure_edge(g2o::EdgeLoopClosure* edge) {
+  bool ack = graph->removeEdge(edge);
   return ack;
 }
 

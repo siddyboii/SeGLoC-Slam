@@ -16,15 +16,12 @@
 
 // Logger for TensorRT
 
-#ifndef S_GRAPHS_DETECTION_STRUCT
-#define S_GRAPHS_DETECTION_STRUCT
 struct Detection {
     float x1, y1, x2, y2;  // Bounding box coordinates
     float confidence;       // Detection confidence
     int class_id;          // Class index
     std::string class_name;
 };
-#endif
 
 class YOLOWorldTensorRT
 {
@@ -62,7 +59,7 @@ class YOLOWorldTensorRT
         float pad_y; // Padding in y direction
         float scale; // Scale factor for resizing
 
-        std::vector<std::string> class_names {  "Persons", "Windows", "Lights", "Door", " "}; // Class names for detected objects
+        std::vector<std::string> class_names {  "Table", "Tree", "Desks", "Computer Monitor", "Pillar", " "}; // Class names for detected objects
 
     public:
         explicit YOLOWorldTensorRT(const std::string& trt_model_path); //in public: Constructor

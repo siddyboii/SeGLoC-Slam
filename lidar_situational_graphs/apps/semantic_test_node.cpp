@@ -21,11 +21,7 @@
 #include <mutex>
 
 // Include the YOLO and CLIP extractors
-#ifdef USE_TENSORRT_YOLO
 #include <s_graphs/common/yolo_object_detector.hpp>
-#else
-#include <s_graphs/common/yolo_onnx_detector.hpp>
-#endif
 #include <s_graphs/common/clip_feature_extractor.hpp>
 
 namespace s_graphs {
@@ -110,13 +106,8 @@ private:
             } else {
                 try {
                     RCLCPP_INFO(this->get_logger(), "Loading YOLO model from: %s", yolo_model_path_.c_str());
-#ifdef USE_TENSORRT_YOLO
                     yolo_detector_ = std::make_unique<YOLOWorldTensorRT>(yolo_model_path_);
-                    RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully! (TensorRT)");
-#else
-                    yolo_detector_ = std::make_unique<YOLOOnnxDetector>(yolo_model_path_);
-                    RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully! (ONNX CPU)");
-#endif
+                    RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully!");
                 } catch (const std::exception& e) {
                     RCLCPP_ERROR(this->get_logger(), "Failed to load YOLO model: %s", e.what());
                     enable_yolo_ = false;
@@ -399,11 +390,7 @@ private:
     bool visualize_detections_;
 
     // Models
-#ifdef USE_TENSORRT_YOLO
     std::unique_ptr<YOLOWorldTensorRT> yolo_detector_;
-#else
-    std::unique_ptr<YOLOOnnxDetector> yolo_detector_;
-#endif
     std::unique_ptr<ClipFeatureExtractor> clip_extractor_;
 
     // ROS interfaces

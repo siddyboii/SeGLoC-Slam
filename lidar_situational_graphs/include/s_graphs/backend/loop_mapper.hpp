@@ -51,6 +51,10 @@ class LoopMapper {
   /// Set the zone cache for zone-based loop closure prefiltering
   void set_zone_cache(std::shared_ptr<ZoneCache> zone_cache);
 
+  /// Check all loop closure edges after optimization; remove those with chi² > threshold
+  int validate_loop_closures(const std::shared_ptr<GraphSLAM>& covisibility_graph,
+                             double chi2_threshold);
+
  private:
   void set_data(g2o::VertexSE3* keyframe_node);
   bool get_floor_data(g2o::VertexSE3* keyframe_node);

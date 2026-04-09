@@ -408,7 +408,28 @@ void SGraphsNode::declare_ros_params() {
   this->declare_parameter("fitness_score_max_range",
                           std::numeric_limits<double>::max());
   this->declare_parameter("fitness_score_thresh", 0.5);
+  this->declare_parameter("icp_trans_cap", 3.0);
   this->declare_parameter("keyframe_matching_threshold", 0.1);
+
+  // Semantic loop proposal
+  this->declare_parameter("enable_semantic_loop_proposal", true);
+  this->declare_parameter("semantic_proposal_thresh", 0.93);
+  this->declare_parameter("semantic_proposal_max_candidates", 3);
+
+  // GNN encoder for loop closure
+  this->declare_parameter("gnn_model_path", std::string(""));
+  this->declare_parameter("enable_gnn_loop_proposal", false);
+  this->declare_parameter("gnn_proposal_thresh", 0.5);
+  this->declare_parameter("loop_temporal_consistency", 2);
+  this->declare_parameter("loop_chi2_threshold", 50.0);
+
+  // Semantic consistency factor
+  this->declare_parameter("enable_semantic_factor", false);
+  this->declare_parameter("semantic_factor_sim_thresh", 0.65);
+  this->declare_parameter("semantic_factor_max_edges_per_kf", 3);
+  this->declare_parameter("semantic_factor_info_weight", 0.1);
+  this->declare_parameter("semantic_factor_max_dist", 15.0);
+  this->declare_parameter("semantic_factor_gamma", 1.5);
 
   this->declare_parameter("registration_method", "NDT_OMP");
   this->declare_parameter("reg_num_threads", 0);
@@ -779,7 +800,6 @@ void SGraphsNode::cloud_image_odom_callback(
 
   pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
   pcl::fromROSMsg(*cloud_msg, *cloud);
-
   //for image_msg convert it to CV Mat
 
   cv_bridge::CvImagePtr cv_ptr;
@@ -879,7 +899,6 @@ void SGraphsNode::room_data_callback(
     const situational_graphs_msgs::msg::RoomsData::SharedPtr rooms_msg) {
   std::lock_guard<std::mutex> lock(room_data_queue_mutex);
   room_data_queue.push_back(*rooms_msg);
-  RCLCPP_ERROR(this->get_logger(), "---------Room data queue is filled and is of size ---------%ld", room_data_queue.size());
 }
 
 void SGraphsNode::floor_data_callback(
@@ -965,10 +984,10 @@ void SGraphsNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
 }
 
 bool SGraphsNode::flush_keyframe_queue() {
-  RCLCPP_INFO(this->get_logger(), "[S_GRAPHS DEBUG] flush_keyframe_queue() called");
+  // RCLCPP_INFO(this->get_logger(), "[S_GRAPHS DEBUG] flush_keyframe_queue() called");
   
   if (keyframe_queue.empty()) {
-    RCLCPP_INFO(this->get_logger(), "[S_GRAPHS DEBUG] keyframe_queue is EMPTY - nothing to flush");
+    // RCLCPP_INFO(this->get_logger(), "[S_GRAPHS DEBUG] keyframe_queue is EMPTY - nothing to flush");
     return false;
   }
 
@@ -989,9 +1008,9 @@ bool SGraphsNode::flush_keyframe_queue() {
                                                      anchor_edge,
                                                      keyframe_hash);
 
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] keyframe_mapper processed %d keyframes. Total keyframes: %zu",
-              num_processed, keyframes.size());
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] keyframe_mapper processed %d keyframes. Total keyframes: %zu",
+  //             num_processed, keyframes.size());
 
   graph_mutex.lock();
   if (floor_mapper->get_floor_level_update_info()) {
@@ -1046,6 +1065,47 @@ bool SGraphsNode::flush_keyframe_queue() {
     }
   }
 
+  // Build structural scene descriptors for each new keyframe
+  // (after planes have been extracted and associated)
+  for (const auto& kf : new_keyframes) {
+    auto desc = SceneDescriptor::extract(
+        kf, x_vert_planes, y_vert_planes, hort_planes, rooms_vec);
+    kf->scene_descriptor = desc.descriptor;
+    RCLCPP_DEBUG(this->get_logger(),
+        "[SCENE_DESC] KF%ld: %d x-planes, %d y-planes, clip=%s, objects=%s",
+        kf->id(),
+        static_cast<int>(kf->x_plane_ids.size()),
+        static_cast<int>(kf->y_plane_ids.size()),
+        kf->clip_embedding ? "yes" : "no",
+        kf->detected_objects ? "yes" : "no");
+
+    // Dump subgraph to JSON for GNN training dataset
+    SubgraphDumper::dump(kf, x_vert_planes, y_vert_planes, hort_planes, rooms_vec);
+
+    // Compute GNN embedding for loop closure proposals
+    if (enable_gnn_ && gnn_encoder_.is_loaded()) {
+      auto tensors = SubgraphDumper::build_tensors(
+          kf, x_vert_planes, y_vert_planes, hort_planes, rooms_vec);
+      if (tensors.num_nodes > 0) {
+        auto emb = gnn_encoder_.encode(
+            tensors.node_features, tensors.num_nodes, tensors.feat_dim,
+            tensors.edge_src, tensors.edge_dst);
+        kf->gnn_embedding = emb;
+
+        // Log every 10th keyframe
+        static int gnn_encode_count = 0;
+        gnn_encode_count++;
+        if (gnn_encode_count <= 3 || gnn_encode_count % 5 == 0) {
+          RCLCPP_INFO(this->get_logger(),
+              "\033[36m[GNN]\033[0m KF%ld encoded: %d nodes, %d edges → 128-dim emb (total: %d)",
+              kf->id(), tensors.num_nodes,
+              static_cast<int>(tensors.edge_src.size()),
+              gnn_encode_count);
+        }
+      }
+    }
+  }
+
   std::lock_guard<std::mutex> lock(keyframe_queue_mutex);
   keyframe_queue.erase(keyframe_queue.begin(),
                        keyframe_queue.begin() + num_processed + 1);
@@ -1055,13 +1115,11 @@ bool SGraphsNode::flush_keyframe_queue() {
 
 void SGraphsNode::flush_room_data_queue() {
   if (keyframes.empty() || floors_vec.empty()) {
-    std::cout << "-----------------------------------keyframe or floor_vec is empty----------------------------------------" << std::endl;
     return;
   } else if (room_data_queue.empty()) {
-    std::cout << "-----------------------------------room data queue is empty----------------------------------------" << std::endl;
+    // std::cout << "room data queue is empty" << std::endl;
     return;
   }
-  RCLCPP_WARN(this->get_logger(), "================KUCH TO CHAL JAA===========================");
 
   // update room height based on current_floor level
   for (auto& room_data_msg : room_data_queue) {
@@ -1072,20 +1130,16 @@ void SGraphsNode::flush_room_data_queue() {
       graph_mutex.unlock();
     }
   }
-  RCLCPP_WARN(this->get_logger(), "KAAM CHALU HAII");
 
   std::deque<std::pair<VerticalPlanes, VerticalPlanes>> dupl_x_vert_planes,
       dupl_y_vert_planes;
   for (const auto& room_data_msg : room_data_queue) {
     for (const auto& room_data : room_data_msg.rooms) {
-      RCLCPP_WARN(this->get_logger(), "SIZE OF X_PLANES IN ROOM DATA QUEUE %ld and SIZE OF Y_PLANES IN ROOM DATA QUEUE %ld", room_data.x_planes.size(), room_data.y_planes.size());
       if (room_data.x_planes.size() == 2 && room_data.y_planes.size() == 2) {
         float x_width = PlaneUtils::width_between_planes(room_data.x_planes[0],
                                                          room_data.x_planes[1]);
         float y_width = PlaneUtils::width_between_planes(room_data.y_planes[0],
                                                          room_data.y_planes[1]);
-        
-        RCLCPP_WARN(this->get_logger(), "WIDTH BW TWO X PLANES %.3f and WIDTH BW TWO Y PLANES %.3f", x_width, y_width);
 
         if (fabs(x_width) < 0.5 || fabs(y_width) < 0.5) continue;
 
@@ -1115,7 +1169,6 @@ void SGraphsNode::flush_room_data_queue() {
       else if (room_data.x_planes.size() == 2 && room_data.y_planes.size() == 0) {
         float x_width = PlaneUtils::width_between_planes(room_data.x_planes[0],
                                                          room_data.x_planes[1]);
-        RCLCPP_WARN_STREAM(this->get_logger(),"WIDTH BW TWO X INFINITE PLANES " << x_width);
         if (fabs(x_width) < 0.5) continue;
 
         int current_room_id;
@@ -1141,7 +1194,6 @@ void SGraphsNode::flush_room_data_queue() {
       else if (room_data.x_planes.size() == 0 && room_data.y_planes.size() == 2) {
         float y_width = PlaneUtils::width_between_planes(room_data.y_planes[0],
                                                          room_data.y_planes[1]);
-        RCLCPP_WARN_STREAM(this->get_logger(),"WIDTH BW TWO Y INFINITE PLANES " << y_width);                                             
         if (fabs(y_width) < 0.5) continue;
 
         int current_room_id;
@@ -1166,7 +1218,6 @@ void SGraphsNode::flush_room_data_queue() {
 
     room_data_queue_mutex.lock();
     room_data_queue.pop_front();
-    RCLCPP_ERROR(this->get_logger(), "_______________________ KHEL KHATAM SIZE LEFT __________  %ld",room_data_queue.size()); 
     room_data_queue_mutex.unlock();
   }
 
@@ -1371,114 +1422,6 @@ void SGraphsNode::keyframe_update_timer_callback() {
                 rooms_vec);
 }
 
-// void SGraphsNode::optimization_timer_callback() {
-//   if (keyframes.empty() || floors_vec.empty()) return;
-
-//   int num_iterations =
-//       this->get_parameter("g2o_solver_num_iterations").get_parameter_value().get<int>();
-
-//   curr_edge_count = covisibility_graph->retrieve_total_nbr_of_edges();
-//   if (curr_edge_count == prev_edge_count) {
-//     return;
-//   }
-
-//   graph_mutex.lock();
-//   const int keyframe_id = keyframes.rbegin()->first;
-//   graph_mutex.unlock();
-
-//   switch (ongoing_optimization_class) {
-//     case optimization_class::GLOBAL: {
-//       handle_global_optimization();
-//       break;
-//     }
-
-//     case optimization_class::LOCAL_GLOBAL: {
-//       handle_local_global_optimization();
-//       break;
-//     }
-
-//     case optimization_class::FLOOR_GLOBAL: {
-//       handle_floor_global_optimization();
-//       break;
-//     }
-
-//     default:
-//       break;
-//   }
-
-//   // optimize the pose graph
-//   try {
-//     graph_mutex.lock();
-//     if (!global_optimization)
-//       compressed_graph->optimize("local", num_iterations);
-//     else {
-//       compressed_graph->optimize("global", num_iterations);
-//     }
-//     graph_mutex.unlock();
-//   } catch (std::invalid_argument& e) {
-//     std::cout << e.what() << std::endl;
-//     throw 1;
-//   }
-
-//   graph_mutex.lock();
-//   std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
-//   auto updated_planes_tuple =
-//       std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
-
-//   GraphUtils::update_graph(compressed_graph,
-//                            keyframes,
-//                            x_vert_planes,
-//                            y_vert_planes,
-//                            hort_planes,
-//                            rooms_vec,
-//                            x_infinite_rooms,
-//                            y_infinite_rooms,
-//                            floors_vec,
-//                            updated_planes_tuple);
-
-//   if (global_optimization) {
-//     plane_mapper->convert_plane_points_to_map(
-//         x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
-//   }
-
-//   Eigen::Isometry3d trans =
-//       keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
-
-//   // publish tf
-//   geometry_msgs::msg::TransformStamped ts =
-//       matrix2transform(keyframes[keyframe_id]->stamp,
-//                        trans.matrix().cast<float>(),
-//                        map_frame_id,
-//                        odom_frame_id);
-//   odom2map_pub->publish(ts);
-//   graph_mutex.unlock();
-
-//   trans_odom2map_mutex.lock();
-//   trans_odom2map = trans.matrix().cast<float>();
-//   trans_odom2map_mutex.unlock();
-
-//   if (ongoing_optimization_class == optimization_class::LOCAL_GLOBAL ||
-//       ongoing_optimization_class == optimization_class::FLOOR_GLOBAL) {
-//     int counter = 0;
-//     for (const auto& room_local_graph_id : room_local_graph_id_queue) {
-//       broadcast_room_graph(room_local_graph_id, num_iterations);
-//       counter++;
-//     }
-
-//     if (!room_local_graph_id_queue.empty()) {
-//       graph_mutex.lock();
-//       room_local_graph_id_queue.erase(room_local_graph_id_queue.begin(),
-//                                       room_local_graph_id_queue.begin() + counter);
-//       graph_mutex.unlock();
-//     }
-  // } else {
-  //   graph_mutex.lock();
-  //   room_local_graph_id_queue.clear();
-  //   graph_mutex.unlock();
-  // }
-
-//   prev_edge_count = curr_edge_count;
-// }
 void SGraphsNode::optimization_timer_callback() {
   std::lock_guard<std::mutex> cycle_lock(graph_cycle_mutex_);
   if (keyframes.empty() || floors_vec.empty()) return;
@@ -1487,10 +1430,7 @@ void SGraphsNode::optimization_timer_callback() {
       this->get_parameter("g2o_solver_num_iterations").get_parameter_value().get<int>();
 
   curr_edge_count = covisibility_graph->retrieve_total_nbr_of_edges();
-  RCLCPP_INFO_STREAM(this->get_logger(),"Returning because Zones_dirty is : "<< !zones_dirty_);
-  RCLCPP_INFO_STREAM(this->get_logger(),"The current Edge count is : "<< curr_edge_count);
   if (curr_edge_count == prev_edge_count) {
-     RCLCPP_INFO_STREAM(this->get_logger(),"Returning from edge count check");
     return;
   }
 
@@ -1499,40 +1439,55 @@ void SGraphsNode::optimization_timer_callback() {
   graph_mutex.unlock();
 
   switch (ongoing_optimization_class) {
-    case optimization_class::GLOBAL:
+    case optimization_class::GLOBAL: {
       handle_global_optimization();
       break;
-    case optimization_class::LOCAL_GLOBAL:
+    }
+
+    case optimization_class::LOCAL_GLOBAL: {
       handle_local_global_optimization();
       break;
-    case optimization_class::FLOOR_GLOBAL:
+    }
+
+    case optimization_class::FLOOR_GLOBAL: {
       handle_floor_global_optimization();
       break;
+    }
+
     default:
       break;
   }
 
+  // optimize the pose graph
   try {
     graph_mutex.lock();
+    if (!global_optimization)
+      compressed_graph->optimize("local", num_iterations);
+    else {
+      compressed_graph->optimize("global", num_iterations);
+    }
+    graph_mutex.unlock();
+  } catch (std::invalid_argument& e) {
+    std::cout << e.what() << std::endl;
+    throw 1;
+  }
 
-    // IMPORTANT: update compressed graph first
-    std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
-    auto updated_planes_tuple =
-        std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
-        RCLCPP_INFO_STREAM(this->get_logger(),"Before Updating graph");
+  graph_mutex.lock();
+  std::vector<int> updated_x_planes, updated_y_planes, updated_hort_planes;
+  auto updated_planes_tuple =
+      std::make_tuple(updated_x_planes, updated_y_planes, updated_hort_planes);
 
-    GraphUtils::update_graph(compressed_graph,
-                             keyframes,
-                             x_vert_planes,
-                             y_vert_planes,
-                             hort_planes,
-                             rooms_vec,
-                             x_infinite_rooms,
-                             y_infinite_rooms,
-                             floors_vec,
-                             updated_planes_tuple);
-
-    // Add/refresh zone factors before optimization
+  GraphUtils::update_graph(compressed_graph,
+                           keyframes,
+                           x_vert_planes,
+                           y_vert_planes,
+                           hort_planes,
+                           rooms_vec,
+                           x_infinite_rooms,
+                           y_infinite_rooms,
+                           floors_vec,
+                           updated_planes_tuple);
+  // Add/refresh zone factors before optimization
     if (zones_dirty_ || graph_rebuilt_since_last_zone_sync_) {
       //attach_zone_factors_to_graph();
       RCLCPP_INFO_STREAM(this->get_logger(),"GOING TO ADD ZONES FACTOR NOWW");
@@ -1540,51 +1495,59 @@ void SGraphsNode::optimization_timer_callback() {
     }
     RCLCPP_INFO_STREAM(this->get_logger(),"About to call the optimization ");
 
-    if (!global_optimization) {
-      compressed_graph->optimize("local", num_iterations);
-    } else {
-      compressed_graph->optimize("global", num_iterations);
+  if (global_optimization) {
+    plane_mapper->convert_plane_points_to_map(
+        x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
+  }
+
+  // ── Post-optimization loop closure validation ──
+  double chi2_thresh = this->get_parameter("loop_chi2_threshold").get_parameter_value().get<double>();
+  int removed = loop_mapper->validate_loop_closures(covisibility_graph, chi2_thresh);
+  if (removed > 0) {
+    RCLCPP_WARN(this->get_logger(),
+        "\033[31m[CHI2_REJECT] Removed %d bad loop edges — re-optimizing\033[0m", removed);
+    
+    // Copy the updated covisibility graph back to compressed
+    GraphUtils::copy_graph(covisibility_graph, compressed_graph, keyframes);
+    
+    // Re-optimize without the bad edges
+    try {
+      if (!global_optimization)
+        compressed_graph->optimize("local", num_iterations);
+      else
+        compressed_graph->optimize("global", num_iterations);
+    } catch (std::invalid_argument& e) {
+      std::cout << e.what() << std::endl;
+      throw 1;
     }
-
-    // Recompute graph state after optimization
-    GraphUtils::update_graph(compressed_graph,
-                             keyframes,
-                             x_vert_planes,
-                             y_vert_planes,
-                             hort_planes,
-                             rooms_vec,
-                             x_infinite_rooms,
-                             y_infinite_rooms,
-                             floors_vec,
-                             updated_planes_tuple);
-
+      
+    // Update poses again
+    std::vector<int> up_x, up_y, up_h;
+    auto up_tup = std::make_tuple(up_x, up_y, up_h);
+    GraphUtils::update_graph(compressed_graph, keyframes, x_vert_planes, y_vert_planes, hort_planes,
+                             rooms_vec, x_infinite_rooms, y_infinite_rooms, floors_vec, up_tup);
+                             
     if (global_optimization) {
       plane_mapper->convert_plane_points_to_map(
-          x_vert_planes, y_vert_planes, hort_planes, updated_planes_tuple);
+          x_vert_planes, y_vert_planes, hort_planes, up_tup);
     }
-
-    Eigen::Isometry3d trans =
-        keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
-
-    geometry_msgs::msg::TransformStamped ts =
-        matrix2transform(keyframes[keyframe_id]->stamp,
-                         trans.matrix().cast<float>(),
-                         map_frame_id,
-                         odom_frame_id);
-    odom2map_pub->publish(ts);
-
-    trans_odom2map_mutex.lock();
-    trans_odom2map = trans.matrix().cast<float>();
-    trans_odom2map_mutex.unlock();
-
-    prev_edge_count = compressed_graph->retrieve_total_nbr_of_edges();
-    graph_mutex.unlock();
-
-  } catch (std::invalid_argument& e) {
-    graph_mutex.unlock();
-    std::cout << e.what() << std::endl;
-    throw 1;
   }
+
+  Eigen::Isometry3d trans =
+      keyframes[keyframe_id]->node->estimate() * keyframes[keyframe_id]->odom.inverse();
+
+  // publish tf
+  geometry_msgs::msg::TransformStamped ts =
+      matrix2transform(keyframes[keyframe_id]->stamp,
+                       trans.matrix().cast<float>(),
+                       map_frame_id,
+                       odom_frame_id);
+  odom2map_pub->publish(ts);
+  graph_mutex.unlock();
+
+  trans_odom2map_mutex.lock();
+  trans_odom2map = trans.matrix().cast<float>();
+  trans_odom2map_mutex.unlock();
 
   if (ongoing_optimization_class == optimization_class::LOCAL_GLOBAL ||
       ongoing_optimization_class == optimization_class::FLOOR_GLOBAL) {
@@ -1600,32 +1563,17 @@ void SGraphsNode::optimization_timer_callback() {
                                       room_local_graph_id_queue.begin() + counter);
       graph_mutex.unlock();
     }
-    else {
+  } else {
     graph_mutex.lock();
     room_local_graph_id_queue.clear();
     graph_mutex.unlock();
-    }
   }
 
   prev_edge_count = curr_edge_count;
-  RCLCPP_INFO_STREAM(this->get_logger(),"Republishing the graph i dont know if this is needed or not");
-  publish_graph(covisibility_graph->graph.get(),
-                keyframes,
-                x_vert_planes,
-                y_vert_planes,
-                x_infinite_rooms,
-                y_infinite_rooms,
-                rooms_vec);
 }
 
 void SGraphsNode::handle_global_optimization() {
   std::lock_guard<std::mutex> lock(graph_mutex);
-  // CRITICAL: Clear these so we don't have pointers to deleted memory
-  // zone_vertices_.clear();
-  // zone_edges_.clear();
-  // zone_edge_versions_.clear();
-  // keyframe_to_zone_.clear();
-
   GraphUtils::copy_graph(covisibility_graph, compressed_graph, keyframes);
   global_optimization = true;
   zones_dirty_ = true;
@@ -1717,11 +1665,11 @@ void SGraphsNode::copy_data(
 
 void SGraphsNode::map_publish_timer_callback(bool pass) {
   std::lock_guard<std::mutex> cycle_lock(graph_cycle_mutex_);
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] ========== map_publish_timer_callback TRIGGERED ==========");
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] keyframes.size()=%zu, floors_vec.size()=%zu",
-              keyframes.size(), floors_vec.size());
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] ========== map_publish_timer_callback TRIGGERED ==========");
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] keyframes.size()=%zu, floors_vec.size()=%zu",
+  //             keyframes.size(), floors_vec.size());
   
   if (keyframes.empty() || floors_vec.empty()) {
     RCLCPP_WARN(this->get_logger(), 
@@ -1729,23 +1677,23 @@ void SGraphsNode::map_publish_timer_callback(bool pass) {
     return;
   }
 
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] Checking subscriber counts...");
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] map_points_pub subscribers: %zu",
-              map_points_pub->get_subscription_count());
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] wall_points_pub subscribers: %zu",
-              wall_points_pub->get_subscription_count());
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] markers_pub subscribers: %zu",
-              markers_pub->get_subscription_count());
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] Checking subscriber counts...");
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] map_points_pub subscribers: %zu",
+  //             map_points_pub->get_subscription_count());
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] wall_points_pub subscribers: %zu",
+  //             wall_points_pub->get_subscription_count());
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] markers_pub subscribers: %zu",
+              // markers_pub->get_subscription_count());
   
   if (map_points_pub->get_subscription_count() == 0 &&
       wall_points_pub->get_subscription_count() == 0 &&
       markers_pub->get_subscription_count() == 0 && !pass) {
-    RCLCPP_WARN(this->get_logger(), 
-                "[S_GRAPHS DEBUG] No viz subscribers and pass=false - publishing graph only");
+    // RCLCPP_WARN(this->get_logger(), 
+    //             "[S_GRAPHS DEBUG] No viz subscribers and pass=false - publishing graph only");
     // Still publish graph_keyframes and graph_structure even without viz subscribers
     publish_graph(covisibility_graph->graph.get(),
                   keyframes,
@@ -1757,8 +1705,8 @@ void SGraphsNode::map_publish_timer_callback(bool pass) {
     return;
   }
 
-  RCLCPP_INFO(this->get_logger(), 
-              "[S_GRAPHS DEBUG] Creating snapshots of graph data...");
+  // RCLCPP_INFO(this->get_logger(), 
+  //             "[S_GRAPHS DEBUG] Creating snapshots of graph data...");
   
   std::vector<KeyFrame::Ptr> kf_snapshot;
   std::unordered_map<int, VerticalPlanes> x_planes_snapshot, y_planes_snapshot;
@@ -3090,13 +3038,8 @@ void SGraphsNode::initializeSemanticModels() {
     } else {
       try {
         RCLCPP_INFO(this->get_logger(), "Loading YOLO model from: %s", yolo_model_path_.c_str());
-#ifdef USE_TENSORRT_YOLO
         yolo_detector_ = std::make_unique<YOLOWorldTensorRT>(yolo_model_path_);
-        RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully! (TensorRT GPU)");
-#else
-        yolo_detector_ = std::make_unique<YOLOOnnxDetector>(yolo_model_path_);
-        RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully! (ONNXRuntime CPU)");
-#endif
+        RCLCPP_INFO(this->get_logger(), "✓ YOLO model loaded successfully!");
       } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "Failed to load YOLO model: %s", e.what());
         enable_yolo_ = false;
@@ -3126,6 +3069,29 @@ void SGraphsNode::initializeSemanticModels() {
     RCLCPP_WARN(this->get_logger(), 
         "Neither YOLO nor CLIP is enabled! Semantic features disabled.");
   }
+
+  // Initialize GNN encoder
+  std::string gnn_model_path = this->get_parameter("gnn_model_path")
+      .get_parameter_value().get<std::string>();
+  enable_gnn_ = this->get_parameter("enable_gnn_loop_proposal")
+      .get_parameter_value().get<bool>();
+  gnn_proposal_thresh_ = this->get_parameter("gnn_proposal_thresh")
+      .get_parameter_value().get<double>();
+
+  if (enable_gnn_ && !gnn_model_path.empty()) {
+    if (gnn_encoder_.load(gnn_model_path)) {
+      RCLCPP_INFO(this->get_logger(),
+          "✓ GNN encoder loaded (thresh=%.2f)", gnn_proposal_thresh_);
+    } else {
+      RCLCPP_ERROR(this->get_logger(),
+          "Failed to load GNN encoder from: %s", gnn_model_path.c_str());
+      enable_gnn_ = false;
+    }
+  } else if (enable_gnn_) {
+    RCLCPP_WARN(this->get_logger(),
+        "GNN loop proposal enabled but no model path set!");
+    enable_gnn_ = false;
+  }
 }
 
 void SGraphsNode::processSemantic(const cv::Mat& image, const std_msgs::msg::Header& header, KeyFrame::Ptr keyframe) {
@@ -3144,8 +3110,8 @@ void SGraphsNode::processSemantic(const cv::Mat& image, const std_msgs::msg::Hea
   processed_count_++;
   auto start_time = std::chrono::high_resolution_clock::now();
 
-  RCLCPP_INFO(this->get_logger(), "=== Processing Semantic Frame %ld (Image: %dx%d) ===",
-              processed_count_, image.cols, image.rows);
+  // RCLCPP_INFO(this->get_logger(), "=== Processing Semantic Frame %ld (Image: %dx%d) ===",
+  //             processed_count_, image.cols, image.rows);
 
   // Run YOLO detection
   std::vector<Detection> detections;
@@ -3263,7 +3229,7 @@ void SGraphsNode::processSemantic(const cv::Mat& image, const std_msgs::msg::Hea
     if (iqa_score_received_) {
       std::lock_guard<std::mutex> kf_lock(keyframe_mutex_);
       keyframe->image_brightness = static_cast<float>(latest_iqa_score_);
-      RCLCPP_INFO(this->get_logger(), "[IQA] Stored quality score %.4f in keyframe", latest_iqa_score_);
+      // RCLCPP_INFO(this->get_logger(), "[IQA] Stored quality score %.4f in keyframe", latest_iqa_score_);
     } else {
       RCLCPP_DEBUG(this->get_logger(), "[IQA] No quality score received yet");
     }

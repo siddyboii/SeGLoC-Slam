@@ -227,7 +227,7 @@ void DynaTrack::compute_optical_flow(const cv::Mat& current_gray) {
     // =========================================================
     std::vector<TrackedCluster> clusters = cluster_vectors(masked_flow, masked_omega, final_mask);
 
-    RCLCPP_INFO(this->get_logger(), "Detected %zu dynamic clusters", clusters.size());
+    // RCLCPP_INFO(this->get_logger(), "Detected %zu dynamic clusters", clusters.size());
     for (size_t k = 0; k < clusters.size(); k++) {
         RCLCPP_DEBUG(this->get_logger(),
             "  Cluster %zu: pos=(%.1f,%.1f) vel=(%.2f,%.2f) omega=%.3f pixels=%d",
@@ -273,10 +273,12 @@ void DynaTrack::compute_optical_flow(const cv::Mat& current_gray) {
         }
 
         dynamic_objects_publisher_->publish(dyn_msg);
-        RCLCPP_INFO(this->get_logger(),
-            "Published DynamicObjects: %d clusters, dynamicity=%.3f (%d/%d pixels)",
-            dyn_msg.num_dynamic_clusters, dyn_msg.scene_dynamicity,
-            total_dyn_pixels, total_occupied);
+
+        // RCLCPP_INFO(this->get_logger(),
+        //     "Published DynamicObjects: %d clusters, dynamicity=%.3f (%d/%d pixels)",
+        //     dyn_msg.num_dynamic_clusters, dyn_msg.scene_dynamicity,
+        //     total_dyn_pixels, total_occupied);
+
     }
 
     // =========================================================

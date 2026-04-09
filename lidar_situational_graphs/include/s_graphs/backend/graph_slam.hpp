@@ -51,6 +51,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #include <g2o/edge_doorway_two_rooms.hpp>
 #include <g2o/edge_infinite_room_plane.hpp>
 #include <g2o/edge_loop_closure.hpp>
+#include <g2o/edge_semantic_consistency.hpp>
 #include <g2o/edge_multi_se3.hpp>
 #include <g2o/edge_plane.hpp>
 #include <g2o/edge_plane_identity.hpp>
@@ -83,6 +84,7 @@ class VertexPointXYZ;
 class VertexInfiniteRoom;
 class EdgeSE3;
 class EdgeLoopClosure;
+class EdgeSemanticConsistency;
 class EdgeSE3Plane;
 class EdgeSE3PointToPlane;
 class EdgeSE3PointXYZ;
@@ -453,6 +455,26 @@ class GraphSLAM {
       const Eigen::MatrixXd& information_matrix);
 
   /**
+   * @brief Add a semantic consistency edge between two SE3 nodes.
+   * Encodes a soft distance constraint from GNN embedding similarity.
+   *
+   * @param v1: keyframe node 1
+   * @param v2: keyframe node 2
+   * @param gnn_similarity: cosine similarity from GNN embeddings [0, 1]
+   * @param info_weight: base information weight
+   * @param max_dist: maximum expected distance for sim→dist mapping
+   * @param gamma: curve shape parameter for sim→dist mapping
+   * @return registered edge
+   */
+  g2o::EdgeSemanticConsistency* add_semantic_consistency_edge(
+      g2o::VertexSE3* v1,
+      g2o::VertexSE3* v2,
+      double gnn_similarity,
+      double info_weight = 1.0,
+      double max_dist = 15.0,
+      double gamma = 1.5);
+
+  /**
    * @brief copy an edge from another graph
    *
    * @param e: edge
@@ -469,6 +491,19 @@ class GraphSLAM {
   g2o::EdgeSE3* copy_loop_closure_edge(g2o::EdgeLoopClosure* e,
                                        g2o::VertexSE3* v1,
                                        g2o::VertexSE3* v2);
+
+  /**
+   * @brief copy a semantic consistency edge from another graph
+   *
+   * @param e: semantic edge
+   * @param v1: SE3 vertex 1
+   * @param v2: SE3 vertex 2
+   * @return registered edge
+   */
+  g2o::EdgeSemanticConsistency* copy_semantic_consistency_edge(
+      g2o::EdgeSemanticConsistency* e,
+      g2o::VertexSE3* v1,
+      g2o::VertexSE3* v2);
 
   /**
    * @brief Add an edge between an SE3 node and a plane node
@@ -502,6 +537,8 @@ class GraphSLAM {
    * @return Succes or failure
    */
   bool remove_se3_plane_edge(g2o::EdgeSE3Plane* se3_plane_edge);
+  
+  bool remove_loop_closure_edge(g2o::EdgeLoopClosure* edge);
 
   /**
    * @brief Update the information of an se3 edge

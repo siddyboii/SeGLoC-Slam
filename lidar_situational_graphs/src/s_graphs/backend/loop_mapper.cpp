@@ -1,5 +1,8 @@
 #include <s_graphs/backend/loop_mapper.hpp>
+#include <s_graphs/common/scene_descriptor.hpp>
+#include <g2o/edge_semantic_consistency.hpp>
 #include <fstream>
+#include <iomanip>
 
 namespace s_graphs {
 
@@ -39,12 +42,42 @@ void LoopMapper::set_zone_cache(std::shared_ptr<ZoneCache> zone_cache) {
               use_zone_prefilter_ ? "ON" : "OFF", zone_confidence_threshold_);
 }
 
+int LoopMapper::validate_loop_closures(
+    const std::shared_ptr<GraphSLAM>& covisibility_graph,
+    double chi2_threshold) {
+  auto* graph = dynamic_cast<g2o::SparseOptimizer*>(covisibility_graph->graph.get());
+  
+  std::vector<g2o::EdgeLoopClosure*> bad_edges;
+  for (auto& edge : graph->edges()) {
+    auto* loop_edge = dynamic_cast<g2o::EdgeLoopClosure*>(edge);
+    if (!loop_edge) continue;
+    
+    loop_edge->computeError();
+    double chi2 = loop_edge->chi2();
+    
+    if (chi2 > chi2_threshold) {
+      bad_edges.push_back(loop_edge);
+      // Log the vertices
+      auto* v1 = dynamic_cast<g2o::VertexSE3*>(loop_edge->vertices()[0]);
+      auto* v2 = dynamic_cast<g2o::VertexSE3*>(loop_edge->vertices()[1]);
+      RCLCPP_WARN(node_->get_logger(),
+          "\033[31m[CHI2_REJECT] Removing loop edge KF%d↔KF%d (chi²=%.2f > %.2f)\033[0m",
+          v1->id(), v2->id(), chi2, chi2_threshold);
+    }
+  }
+  
+  for (auto* edge : bad_edges) {
+    graph->removeEdge(edge);
+  }
+  return bad_edges.size();
+}
+
 void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
                            const std::vector<Loop::Ptr>& loops) {
-  RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
-  RCLCPP_WARN(node_->get_logger(), "║         LOOP CLOSURE SEMANTIC WEIGHTING PIPELINE            ║");
-  RCLCPP_WARN(node_->get_logger(), "╚════════════════════════════════════════════════════════════╝");
-  RCLCPP_WARN(node_->get_logger(), "[SEMANTIC LOOP MAPPER] Processing %zu loop closures", loops.size());
+  // RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
+  // RCLCPP_WARN(node_->get_logger(), "║         LOOP CLOSURE SEMANTIC WEIGHTING PIPELINE            ║");
+  // RCLCPP_WARN(node_->get_logger(), "╚════════════════════════════════════════════════════════════╝");
+  // RCLCPP_WARN(node_->get_logger(), "[SEMANTIC LOOP MAPPER] Processing %zu loop closures", loops.size());
   
   int semantic_weighted_loops = 0;
   int geometry_only_loops = 0;
@@ -52,7 +85,7 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
   double avg_alpha = 0.0;
   
   for (const auto& loop : loops) {
-    RCLCPP_WARN(node_->get_logger(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    // RCLCPP_WARN(node_->get_logger(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // ── Per-loop CSV tracking variables ──
     double csv_clip_sim = -1.0;        // -1 means unavailable
@@ -76,255 +109,106 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
     Eigen::MatrixXd information_matrix = inf_calclator->calc_information_matrix(
         loop->key1->cloud, loop->key2->cloud, relpose);
     
-    RCLCPP_WARN(node_->get_logger(), "[GEOMETRY] ICP fitness score: %.6f", icp_fitness);
-    RCLCPP_WARN(node_->get_logger(), "[GEOMETRY] Information matrix condition number: %.4f",
-                information_matrix.norm());
+    // RCLCPP_WARN(node_->get_logger(), "[GEOMETRY] ICP fitness score: %.6f", icp_fitness);
+    // // RCLCPP_WARN(node_->get_logger(), "[GEOMETRY] Information matrix condition number: %.4f",
+    //             information_matrix.norm());
 
     double semantic_alpha = 1.0;
+    bool BASELINE_MODE = false;
     std::string clip_status = "❌ UNAVAILABLE";
-    
-    // Check for CLIP embeddings
-    if (loop->key1->clip_embedding && loop->key2->clip_embedding) {
-      RCLCPP_WARN(node_->get_logger(), "[CLIP] ✓ Both keyframes have CLIP embeddings!");
-      
-      double clip_sim = computeClipSimilarity(
-          loop->key1->clip_embedding.value(),
-          loop->key2->clip_embedding.value());
-      csv_has_clip = true;
-      csv_clip_sim = clip_sim;
-      
-      // Compute object overlap
-      double object_overlap = 0.5;  // Default neutral
-      if (loop->key1->detected_objects && loop->key2->detected_objects) {
-        object_overlap = computeObjectOverlap(
-            loop->key1->detected_objects.value(),
-            loop->key2->detected_objects.value());
-        csv_object_overlap = object_overlap;
-        
-        // Log object overlap with confidence assessment
-        std::string object_confidence;
-        if (object_overlap >= 0.7) {
-          object_confidence = "🟢 STRONG (objects match well)";
-        } else if (object_overlap >= 0.5) {
-          object_confidence = "🟡 MODERATE (partial object match)";
-        } else {
-          object_confidence = "🔴 WEAK (objects don't match)";
-        }
-        RCLCPP_WARN(node_->get_logger(),
-                    "[OBJECT OVERLAP] Score: %.4f %s", object_overlap,
-                    object_confidence.c_str());
-      } else {
-        RCLCPP_WARN(node_->get_logger(),
-                    "[OBJECT OVERLAP] ❌ One or both keyframes missing objects");
-      }
-      
-      semantic_alpha = confidenceToAlpha(clip_sim);
-      
-      // Apply object overlap adjustment
-      if (object_overlap > 0.7) {
-        semantic_alpha *= 1.15;  // Boost by 15% if objects strongly match
-        RCLCPP_WARN(node_->get_logger(),
-                    "[SEMANTIC BOOST] Strong object match → α *= 1.15");
-      } else if (object_overlap < 0.3) {
-        semantic_alpha *= 0.85;  // Reduce by 15% if objects don't match
-        RCLCPP_WARN(node_->get_logger(),
-                    "[SEMANTIC PENALTY] Weak object match → α *= 0.85");
-      }
-      
-      // GEOMETRY-SEMANTIC INTERACTION: Modulate semantic influence based on ICP fitness
-      // When geometry is very reliable, semantic signals matter less (they should just confirm)
-      // When geometry is unreliable, semantic signals become critical
-      double geometric_reliability = 1.0 - (icp_fitness / fitness_score_thresh);
-      // Clamp to [0, 1]: 0 = fitness at threshold (unreliable), 1 = perfect match (very reliable)
-      geometric_reliability = std::max(0.0, std::min(1.0, geometric_reliability));
-      
-      // When geometry is excellent (rel ~1.0), dampen semantic deviations
-      // When geometry is poor (rel ~0.0), amplify semantic deviations
-      double damping_factor = 0.5;  // Controls how much geometry reliability dampens semantics
-      double semantic_influence = 1.0 - (geometric_reliability * damping_factor);
-      
-      // Apply geometry-semantic interaction
-      // If semantic_alpha would boost (> 1.0), reduce the boost when geometry is excellent
-      // If semantic_alpha would penalize (< 1.0), reduce the penalty when geometry is excellent
-      double alpha_before_geometry = semantic_alpha;
-      semantic_alpha = 1.0 + (semantic_alpha - 1.0) * semantic_influence;
-      
+    bool semantic_rejected = false;
+
+    if (!BASELINE_MODE) {
+
+    // ── Scene Descriptor Verification ──
+    // Compare structural+semantic scene descriptors for loop closure verification
+    if (loop->key1->scene_descriptor && loop->key2->scene_descriptor) {
+      // Compute weighted similarity (structural vs CLIP components)
+      // Weights: 0.5 structural + 0.5 CLIP (default — tune for ablation)
+      double scene_sim = SceneDescriptor::similarity(
+          loop->key1->scene_descriptor.value(),
+          loop->key2->scene_descriptor.value(),
+          0.5, 0.5);  // structural_weight, clip_weight
+
+      // Also compute component-wise similarities for logging
+      double struct_only_sim = SceneDescriptor::similarity(
+          loop->key1->scene_descriptor.value(),
+          loop->key2->scene_descriptor.value(),
+          1.0, 0.0);  // structural only
+      double clip_only_sim = SceneDescriptor::similarity(
+          loop->key1->scene_descriptor.value(),
+          loop->key2->scene_descriptor.value(),
+          0.0, 1.0);  // CLIP only
+
       RCLCPP_WARN(node_->get_logger(),
-                  "[GEOMETRY-SEMANTIC] Geometric reliability: %.4f, "
-                  "Semantic influence factor: %.4f, "
-                  "Alpha adjusted: %.4f → %.4f",
-                  geometric_reliability, semantic_influence, 
-                  alpha_before_geometry, semantic_alpha);
-      
-      // IMAGE QUALITY GATING: Reduce semantic trust when image quality is poor
-      // IQA score from Python node stored in keyframe->image_brightness
-      // IQA score is NORMALIZED to [0, 1] range using sigmoid in Python
-      double quality_gate = 1.0;  // Default: full semantic trust
-      if (loop->key1->image_brightness && loop->key2->image_brightness) {
-        double q1 = static_cast<double>(loop->key1->image_brightness.value());
-        double q2 = static_cast<double>(loop->key2->image_brightness.value());
-        double min_quality = std::min(q1, q2);
-        
-        // IQA score is already normalized to [0, 1] by sigmoid in Python
-        // Use directly as quality gate
-        quality_gate = min_quality;
-        
-        // Blend: when quality is low, regress alpha toward neutral (1.0)
-        double alpha_before_quality = semantic_alpha;
-        semantic_alpha = quality_gate * semantic_alpha + (1.0 - quality_gate) * 1.0;
-        csv_quality_gate = quality_gate;
-        
+          "[SCENE_DESC] KF%d↔KF%d  similarity=%.4f  "
+          "(structural=%.4f, clip=%.4f)",
+          loop->key1->node->id(), loop->key2->node->id(),
+          scene_sim, struct_only_sim, clip_only_sim);
+
+      // ── Decision thresholds ──
+      // Indoor CLIP scores cluster in [0.85, 0.96] — thresholds must be tight
+      if (scene_sim < 0.83) {
+        // HARD REJECT: below the typical indoor range → different place
         RCLCPP_WARN(node_->get_logger(),
-                    "[IMAGE QUALITY] q1=%.4f, q2=%.4f, min=%.4f, gate=%.4f, "
-                    "Alpha: %.4f → %.4f",
-                    q1, q2, min_quality, quality_gate,
-                    alpha_before_quality, semantic_alpha);
+            "[SCENE_DESC] ✗ REJECTED — similarity %.4f < 0.83 threshold", scene_sim);
+        semantic_rejected = true;
+        clip_status = "✗ REJECTED by scene descriptor";
+      } else if (scene_sim < 0.88) {
+        // SOFT PENALTY: borderline — reduce information matrix
+        semantic_alpha = 0.5;
+        RCLCPP_WARN(node_->get_logger(),
+            "[SCENE_DESC] ⚠ LOW confidence (%.4f) — α = 0.5", scene_sim);
+        clip_status = "⚠ LOW confidence scene match";
+        semantic_weighted_loops++;
+      } else if (scene_sim > 0.93) {
+        // BOOST: very high match — strong same-place confidence
+        semantic_alpha = 1.5;
+        RCLCPP_WARN(node_->get_logger(),
+            "[SCENE_DESC] ✓ STRONG match (%.4f) — α = 1.5", scene_sim);
+        clip_status = "✓ STRONG scene match";
+        semantic_weighted_loops++;
       } else {
+        // NEUTRAL: 0.93-0.96 — moderate match, keep α = 1.0
         RCLCPP_WARN(node_->get_logger(),
-                    "[IMAGE QUALITY] ❌ Quality scores unavailable (IQA node not running?)");
+            "[SCENE_DESC] → NEUTRAL match (%.4f) — α = 1.0", scene_sim);
+        clip_status = "→ NEUTRAL scene match";
+        semantic_weighted_loops++;
       }
 
-      // === SCENE DYNAMICITY FACTOR (DynaTrack) ===
-      // Penalize loop closures in highly dynamic scenes where point cloud
-      // matching is less reliable due to moving objects.
-      if (loop->key1->scene_dynamicity && loop->key2->scene_dynamicity) {
-        double dyn1 = static_cast<double>(loop->key1->scene_dynamicity.value());
-        double dyn2 = static_cast<double>(loop->key2->scene_dynamicity.value());
-        double max_dyn = std::max(dyn1, dyn2);
-
-        // Penalize proportionally: high dynamicity → reduce trust
-        // dyn_factor ranges from 1.0 (static scene) to 0.7 (fully dynamic)
-        double dyn_penalty_strength = 0.3;  // max 30% reduction
-        double dyn_factor = 1.0 - max_dyn * dyn_penalty_strength;
-
-        double alpha_before_dyn = semantic_alpha;
-        semantic_alpha *= dyn_factor;
-        csv_dyn_factor = dyn_factor;
-
-        RCLCPP_WARN(node_->get_logger(),
-                    "[DYNAMICITY] dyn1=%.3f, dyn2=%.3f, max=%.3f, factor=%.3f, "
-                    "Alpha: %.4f → %.4f",
-                    dyn1, dyn2, max_dyn, dyn_factor,
-                    alpha_before_dyn, semantic_alpha);
-      } else {
-        RCLCPP_WARN(node_->get_logger(),
-                    "[DYNAMICITY] ❌ Dynamicity scores unavailable (DynaTrack not running?)");
-      }
-
-      // === ZONE-BASED SEMANTIC COHERENCE FACTOR ===
-      // If both keyframes belong to known zones, use zone information to
-      // modulate loop closure trust:
-      // - Same zone → boost (semantically coherent)
-      // - Different zones with shared support planes → neutral/mild penalty
-      // - Different zones with NO shared planes → strong penalty
-      if (zone_cache_ && use_zone_prefilter_) {
-        int z1 = zone_cache_->get_zone_for_keyframe(loop->key1->node->id());
-        int z2 = zone_cache_->get_zone_for_keyframe(loop->key2->node->id());
-        csv_zone1 = z1;
-        csv_zone2 = z2;
-
-        if (z1 >= 0 && z2 >= 0) {
-          double zone_factor = 1.0;
-          if (z1 == z2) {
-            // Same zone — strong semantic agreement, boost confidence
-            double zone_conf = zone_cache_->get_zone_confidence(z1);
-            zone_factor = 1.0 + zone_conf * 0.2;  // up to 20% boost
-            RCLCPP_WARN(node_->get_logger(),
-                        "[ZONE] ✓ SAME zone %d (conf=%.2f), boost factor=%.3f",
-                        z1, zone_conf, zone_factor);
-          } else {
-            // Different zones — check shared support planes
-            auto planes1 = zone_cache_->get_support_plane_ids(z1);
-            auto planes2 = zone_cache_->get_support_plane_ids(z2);
-            int shared_planes = 0;
-            for (int pid : planes1) {
-              if (planes2.count(pid)) shared_planes++;
-            }
-
-            if (shared_planes > 0) {
-              // Adjacent zones (shared walls) — mild penalty
-              zone_factor = 0.9;
-              RCLCPP_WARN(node_->get_logger(),
-                          "[ZONE] ⚠ Different zones %d↔%d, %d shared planes, "
-                          "mild penalty factor=%.3f",
-                          z1, z2, shared_planes, zone_factor);
-            } else {
-              // Distant zones (no shared walls) — strong penalty
-              double conf1 = zone_cache_->get_zone_confidence(z1);
-              double conf2 = zone_cache_->get_zone_confidence(z2);
-              double min_conf = std::min(conf1, conf2);
-              // Scale penalty by confidence: high-confidence zones → stronger penalty
-              zone_factor = 1.0 - min_conf * 0.5;  // up to 50% reduction
-              zone_factor = std::max(0.3, zone_factor);  // never go below 30%
-
-              RCLCPP_WARN(node_->get_logger(),
-                          "[ZONE] ✗ DIFFERENT zones %d↔%d, NO shared planes, "
-                          "confs=(%.2f, %.2f), penalty factor=%.3f",
-                          z1, z2, conf1, conf2, zone_factor);
-            }
-          }
-
-          double alpha_before_zone = semantic_alpha;
-          semantic_alpha *= zone_factor;
-          csv_zone_factor = zone_factor;
-          csv_same_zone = (z1 == z2);
-          RCLCPP_WARN(node_->get_logger(),
-                      "[ZONE] Alpha: %.4f → %.4f", alpha_before_zone, semantic_alpha);
-        } else {
-          RCLCPP_WARN(node_->get_logger(),
-                      "[ZONE] Keyframe(s) not in any zone (kf%d→z%d, kf%d→z%d)",
-                      loop->key1->node->id(), z1,
-                      loop->key2->node->id(), z2);
-        }
-      } else if (!zone_cache_) {
-        RCLCPP_WARN(node_->get_logger(),
-                    "[ZONE] ❌ Zone cache not available");
-      }
-      
-      semantic_weighted_loops++;
-      avg_clip_similarity += clip_sim;
       avg_alpha += semantic_alpha;
-      
-      // Determine confidence level
-      std::string confidence_level;
-      if (clip_sim >= 0.85) {
-        confidence_level = "🟢 VERY HIGH";
-      } else if (clip_sim >= 0.70) {
-        confidence_level = "🟡 HIGH";
-      } else if (clip_sim >= 0.50) {
-        confidence_level = "🟠 MEDIUM";
-      } else {
-        confidence_level = "🔴 LOW";
-      }
-      
-      RCLCPP_WARN(node_->get_logger(), 
-                  "[CLIP SIMILARITY] %.4f %s", clip_sim, confidence_level.c_str());
-      RCLCPP_WARN(node_->get_logger(), 
-                  "[INFORMATION MATRIX SCALING] Alpha (after geometry-semantic adjustment) = %.4f", semantic_alpha);
-      
-      // Show scaling direction
-      if (semantic_alpha > 1.0) {
-        RCLCPP_WARN(node_->get_logger(), 
-                    "[SCALING] 📈 BOOSTING information matrix (trust loop closure)");
-      } else if (semantic_alpha < 1.0) {
-        RCLCPP_WARN(node_->get_logger(), 
-                    "[SCALING] 📉 REDUCING information matrix (less trust in loop)");
-      } else {
-        RCLCPP_WARN(node_->get_logger(), 
-                    "[SCALING] ➡️  NEUTRAL scaling (alpha = 1.0)");
-      }
-      
-      clip_status = "✓ USED FOR WEIGHTING";
+
     } else {
       geometry_only_loops++;
-      RCLCPP_WARN(node_->get_logger(), 
-                  "[CLIP] Missing embeddings - Using geometry-only weighting (alpha = 1.0)");
-      if (!loop->key1->clip_embedding) {
-        RCLCPP_WARN(node_->get_logger(), "  → Keyframe %d: No CLIP embedding", loop->key1->node->id());
+      RCLCPP_WARN(node_->get_logger(),
+          "[SCENE_DESC] ❌ One or both keyframes missing scene descriptors — geometry only");
+    }
+
+    }  // end if (!BASELINE_MODE)
+
+    // Skip this loop if semantically rejected
+    if (semantic_rejected) {
+      RCLCPP_WARN(node_->get_logger(),
+          "[LOOP] ✗ Skipping loop KF%d↔KF%d — rejected by scene descriptor",
+          loop->key1->node->id(), loop->key2->node->id());
+      // Write rejection to CSV
+      if (loop_metrics_csv_.is_open()) {
+        loop_metrics_csv_
+            << loop->key1->node->id() << ","
+            << loop->key2->node->id() << ","
+            << 0 << ","  // has_clip
+            << "N/A" << ","  // clip_sim
+            << semantic_alpha << ","
+            << icp_fitness << ","
+            << "N/A" << ","  // object_overlap
+            << "N/A" << ","  // quality_gate
+            << "N/A" << ","  // dyn_factor
+            << "N/A" << ","  // zone_factor
+            << 0.0 << ","  // info_matrix_norm
+            << 0 << ","  // edge_added = false
+            << "REJECTED_BY_SCENE_DESC\n";
       }
-      if (!loop->key2->clip_embedding) {
-        RCLCPP_WARN(node_->get_logger(), "  → Keyframe %d: No CLIP embedding", loop->key2->node->id());
-      }
+      continue;  // skip to next loop
     }
 
     // Apply semantic weighting
@@ -334,7 +218,27 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
                 information_matrix.norm());
 
     shared_graph_mutex.lock();
-    
+
+    // ── Relative pose sanity diagnostics ──
+    Eigen::Vector3d t = relpose.translation();
+    Eigen::AngleAxisd aa(relpose.rotation());
+    double trans_dist = t.norm();
+    double rot_deg = aa.angle() * 180.0 / M_PI;
+    RCLCPP_WARN(node_->get_logger(),
+                "[RELPOSE] KF%d↔KF%d  translation=(%.3f, %.3f, %.3f) norm=%.3fm  "
+                "rotation=%.1f°  fitness=%.4f",
+                loop->key1->node->id(), loop->key2->node->id(),
+                t.x(), t.y(), t.z(), trans_dist, rot_deg, loop->fitness_score);
+    // Warn if the relative pose looks suspicious
+    if (trans_dist > 5.0) {
+      RCLCPP_ERROR(node_->get_logger(),
+                   "[RELPOSE] ⚠ LARGE TRANSLATION (%.3fm > 5m) — likely bad ICP result!", trans_dist);
+    }
+    if (rot_deg > 45.0 && rot_deg < 135.0) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[RELPOSE] ⚠ DIAGONAL ROTATION (%.1f°) — check if 180° fallback applied correctly", rot_deg);
+    }
+
     std::cout << "loop found between keyframes " << loop->key1->node->id() << " and "
               << loop->key2->node->id() << std::endl;
 
@@ -353,6 +257,47 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
       RCLCPP_WARN(node_->get_logger(), 
                   "[EDGE ADDED] ✓ Loop closure edge added with semantic weighting [%s]",
                   clip_status.c_str());
+
+      // ── Semantic Consistency Factor ──
+      // Add a soft distance constraint from GNN embedding similarity
+      bool enable_sem_factor = node_->get_parameter("enable_semantic_factor")
+                                   .get_parameter_value().get<bool>();
+      if (enable_sem_factor &&
+          loop->key1->gnn_embedding && loop->key2->gnn_embedding) {
+        const auto& emb1 = loop->key1->gnn_embedding.value();
+        const auto& emb2 = loop->key2->gnn_embedding.value();
+        double gnn_sim = 0.0;
+        for (size_t i = 0; i < emb1.size() && i < emb2.size(); i++) {
+          gnn_sim += emb1[i] * emb2[i];
+        }
+
+        double sim_thresh = node_->get_parameter("semantic_factor_sim_thresh")
+                                .get_parameter_value().get<double>();
+        if (gnn_sim > sim_thresh) {
+          double info_weight = node_->get_parameter("semantic_factor_info_weight")
+                                   .get_parameter_value().get<double>();
+          double max_dist = node_->get_parameter("semantic_factor_max_dist")
+                                .get_parameter_value().get<double>();
+          double gamma = node_->get_parameter("semantic_factor_gamma")
+                             .get_parameter_value().get<double>();
+
+          auto sem_edge = covisibility_graph->add_semantic_consistency_edge(
+              loop->key1->node, loop->key2->node,
+              gnn_sim, info_weight, max_dist, gamma);
+          covisibility_graph->add_robust_kernel(sem_edge, "Huber", 2.0);
+
+          double expected_dist = g2o::EdgeSemanticConsistency::similarityToDistance(
+              gnn_sim, max_dist, gamma);
+          std::cout << "\033[35m[SEMANTIC_FACTOR]\033[0m KF"
+                    << loop->key1->node->id() << " ↔ KF"
+                    << loop->key2->node->id()
+                    << " (sim=" << std::fixed << std::setprecision(3) << gnn_sim
+                    << ", expected_dist=" << expected_dist << "m"
+                    << ", info=" << std::setprecision(4)
+                    << g2o::EdgeSemanticConsistency::similarityToInformation(gnn_sim, info_weight)
+                    << ")" << std::endl;
+        }
+      }
     } else {
       csv_edge_added = false;
       RCLCPP_WARN(node_->get_logger(), 
@@ -383,16 +328,16 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
   }
   
   // Summary statistics
-  RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
-  RCLCPP_WARN(node_->get_logger(), "║               SEMANTIC WEIGHTING SUMMARY                    ║");
-  RCLCPP_WARN(node_->get_logger(), "╚════════════════════════════════════════════════════════════╝");
-  RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Total loops: %zu", loops.size());
-  RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Semantically weighted: %d (%.1f%%)", 
-              semantic_weighted_loops, 
-              loops.empty() ? 0.0 : (semantic_weighted_loops * 100.0 / loops.size()));
-  RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Geometry-only: %d (%.1f%%)", 
-              geometry_only_loops,
-              loops.empty() ? 0.0 : (geometry_only_loops * 100.0 / loops.size()));
+  // RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
+  // RCLCPP_WARN(node_->get_logger(), "║               SEMANTIC WEIGHTING SUMMARY                    ║");
+  // RCLCPP_WARN(node_->get_logger(), "╚════════════════════════════════════════════════════════════╝");
+  // RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Total loops: %zu", loops.size());
+  // RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Semantically weighted: %d (%.1f%%)", 
+  //             semantic_weighted_loops, 
+  //             loops.empty() ? 0.0 : (semantic_weighted_loops * 100.0 / loops.size()));
+  // RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Geometry-only: %d (%.1f%%)", 
+  //             geometry_only_loops,
+  //             loops.empty() ? 0.0 : (geometry_only_loops * 100.0 / loops.size()));
   
   if (semantic_weighted_loops > 0) {
     RCLCPP_WARN(node_->get_logger(), "[SUMMARY] Avg CLIP similarity: %.4f", 
@@ -401,7 +346,7 @@ void LoopMapper::add_loops(const std::shared_ptr<GraphSLAM>& covisibility_graph,
                 avg_alpha / semantic_weighted_loops);
   }
   
-  RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
+  // RCLCPP_WARN(node_->get_logger(), "╔════════════════════════════════════════════════════════════╗");
 }
 
 void LoopMapper::set_data(g2o::VertexSE3* keyframe_node) {

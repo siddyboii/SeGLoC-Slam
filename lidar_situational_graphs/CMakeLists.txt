@@ -53,45 +53,30 @@ find_package(situational_graphs_reasoning_msgs REQUIRED)
 # for YOLO inference. ONNXRuntime is needed for CLIP inference.
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(CUDA REQUIRED)
 find_package(OpenCV REQUIRED)
 
-# ── CUDA is OPTIONAL ──
-# On CPU-only systems, YOLO runs via ONNXRuntime instead of TensorRT
-find_package(CUDA QUIET)
-if(CUDA_FOUND)
-    message(STATUS "CUDA found: ${CUDA_TOOLKIT_ROOT_DIR}")
-else()
-    message(STATUS "CUDA NOT found — building in CPU-only mode (ONNX YOLO)")
-endif()
+# Find TensorRT - required for YOLO detector
+# Rationale: TensorRT provides optimized GPU inference for the YOLO model
+find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/include/x86_64-linux-gnu /usr/local/include
+    PATH_SUFFIXES include)
+find_library(TENSORRT_LIBRARY nvinfer
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
+    PATH_SUFFIXES lib lib64)
+find_library(TENSORRT_ONNXPARSER nvonnxparser
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
+    PATH_SUFFIXES lib lib64)
 
-# Find TensorRT (optional — only available with CUDA)
-if(CUDA_FOUND)
-    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-        HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/include/x86_64-linux-gnu /usr/local/include
-        PATH_SUFFIXES include)
-    find_library(TENSORRT_LIBRARY nvinfer
-        HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
-        PATH_SUFFIXES lib lib64)
-    find_library(TENSORRT_ONNXPARSER nvonnxparser
-        HINTS ${CUDA_TOOLKIT_ROOT_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
-        PATH_SUFFIXES lib lib64)
-endif()
-
-# Find ONNXRuntime — used for CLIP always, and YOLO on CPU-only builds
+# Find ONNXRuntime - required for CLIP feature extractor
+# Rationale: CLIP model is in ONNX format and requires ONNXRuntime for inference
 find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
     HINTS /usr/include /usr/local/include ${ONNXRUNTIME_ROOT}/include
     PATH_SUFFIXES onnxruntime)
 find_library(ONNXRUNTIME_LIBRARY onnxruntime
     HINTS /usr/lib /usr/local/lib ${ONNXRUNTIME_ROOT}/lib)
 
-# Determine build mode: TensorRT (GPU) vs ONNX-only (CPU)
-if(TENSORRT_LIBRARY AND CUDA_FOUND)
-    set(USE_TENSORRT_YOLO ON)
-    message(STATUS "YOLO backend: TensorRT (GPU)")
-else()
-    set(USE_TENSORRT_YOLO OFF)
-    message(STATUS "YOLO backend: ONNXRuntime (CPU)")
-endif()
+
 
 message(STATUS "TensorRT include: ${TENSORRT_INCLUDE_DIR}")
 message(STATUS "TensorRT library: ${TENSORRT_LIBRARY}")
@@ -197,20 +182,11 @@ FILE(GLOB_RECURSE S_GRAPHS_SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/s_graphs/*.cpp
 )
 
-# Conditionally include semantic feature files based on available backends
-if(USE_TENSORRT_YOLO)
-  # GPU mode: use TensorRT YOLO, exclude ONNX YOLO
-  list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "yolo_onnx_detector\\.cpp$")
-  if(NOT ONNXRUNTIME_LIBRARY)
-    list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "clip_feature_extractor\\.cpp$")
-  endif()
-else()
-  # CPU mode: use ONNX YOLO, exclude TensorRT YOLO
+# Conditionally include semantic feature files if TensorRT and ONNXRuntime are available
+if(NOT TENSORRT_LIBRARY OR NOT ONNXRUNTIME_LIBRARY)
+  # Exclude semantic feature files if dependencies are not available
+  list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "clip_feature_extractor\\.cpp$")
   list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "yolo_object_detector\\.cpp$")
-  if(NOT ONNXRUNTIME_LIBRARY)
-    list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "clip_feature_extractor\\.cpp$")
-    list(FILTER S_GRAPHS_SOURCE_FILES EXCLUDE REGEX "yolo_onnx_detector\\.cpp$")
-  endif()
 endif()
 
 add_library(g2o_${PROJECT_NAME}
@@ -230,10 +206,8 @@ target_link_libraries(${PROJECT_NAME}_core_lib
                       ${PCL_LIBRARIES}
                       )
 
-# Link semantic dependencies based on build mode
-if(USE_TENSORRT_YOLO AND ONNXRUNTIME_LIBRARY)
-  # Full GPU mode: TensorRT YOLO + ONNX CLIP
-  target_compile_definitions(${PROJECT_NAME}_core_lib PRIVATE USE_TENSORRT_YOLO)
+# Link semantic dependencies if available
+if(TENSORRT_LIBRARY AND ONNXRUNTIME_LIBRARY)
   target_include_directories(${PROJECT_NAME}_core_lib PRIVATE
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIRS}
@@ -247,17 +221,9 @@ if(USE_TENSORRT_YOLO AND ONNXRUNTIME_LIBRARY)
     ${ONNXRUNTIME_LIBRARY}
     ${OpenCV_LIBRARIES}
   )
-elseif(ONNXRUNTIME_LIBRARY)
-  # CPU mode: ONNX YOLO + ONNX CLIP
-  target_include_directories(${PROJECT_NAME}_core_lib PRIVATE
-    ${ONNXRUNTIME_INCLUDE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-  )
-  target_link_libraries(${PROJECT_NAME}_core_lib
-    ${ONNXRUNTIME_LIBRARY}
-    ${OpenCV_LIBRARIES}
-  )
 endif()
+
+
 # Note: semantic_test_node is compiled separately and only when TensorRT + ONNXRuntime are available
 # The core library does NOT include CLIP/YOLO code
 target_include_directories(${PROJECT_NAME}_core_lib
@@ -276,39 +242,20 @@ add_executable(s_graphs_node
   apps/s_graphs_node.cpp
 )
 ament_target_dependencies(s_graphs_node ${DEPENDENCIES})
-
-# Conditionally add include dirs and link libraries for s_graphs_node
-if(USE_TENSORRT_YOLO)
-  target_compile_definitions(s_graphs_node PRIVATE USE_TENSORRT_YOLO)
-  target_include_directories(s_graphs_node PRIVATE
-    ${CUDA_INCLUDE_DIRS}
-    ${TENSORRT_INCLUDE_DIR}
-    ${ONNXRUNTIME_INCLUDE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-  )
-  target_link_libraries(s_graphs_node
-    ${PROJECT_NAME}_core_lib
-    ${CUDA_LIBRARIES}
-    ${TENSORRT_LIBRARY}
-    ${TENSORRT_ONNXPARSER}
-    ${ONNXRUNTIME_LIBRARY}
-    ${OpenCV_LIBRARIES}
-  )
-elseif(ONNXRUNTIME_LIBRARY)
-  target_include_directories(s_graphs_node PRIVATE
-    ${ONNXRUNTIME_INCLUDE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-  )
-  target_link_libraries(s_graphs_node
-    ${PROJECT_NAME}_core_lib
-    ${ONNXRUNTIME_LIBRARY}
-    ${OpenCV_LIBRARIES}
-  )
-else()
-  target_link_libraries(s_graphs_node
-    ${PROJECT_NAME}_core_lib
-  )
-endif()
+target_include_directories(s_graphs_node PRIVATE
+  ${CUDA_INCLUDE_DIRS}
+  ${TENSORRT_INCLUDE_DIR}
+  ${ONNXRUNTIME_INCLUDE_DIR}
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(s_graphs_node
+  ${PROJECT_NAME}_core_lib
+  ${CUDA_LIBRARIES}
+  ${TENSORRT_LIBRARY}
+  ${TENSORRT_ONNXPARSER}
+  ${ONNXRUNTIME_LIBRARY}
+  ${OpenCV_LIBRARIES}
+)
 
 # nodes
 add_executable(s_graphs_prefiltering_node apps/prefiltering_node.cpp)
@@ -343,9 +290,12 @@ target_link_libraries(s_graphs_scan_matching_odometry_node
 )
 
 # Semantic Test Harness Node
-# Builds with TensorRT on GPU systems, or ONNXRuntime on CPU-only systems
-if(USE_TENSORRT_YOLO AND ONNXRUNTIME_LIBRARY)
-    message(STATUS "Building semantic_test_node (TensorRT + ONNXRuntime)")
+# Rationale: This is a standalone test node that doesn't depend on the full s_graphs
+# pipeline. It links directly to TensorRT/ONNXRuntime for YOLO/CLIP inference and
+# uses cv_bridge for image conversion. The conditional build ensures it only builds
+# when the required dependencies (TensorRT, ONNXRuntime) are found.
+if(TENSORRT_LIBRARY AND ONNXRUNTIME_LIBRARY)
+    message(STATUS "Building semantic_test_node (TensorRT and ONNXRuntime found)")
     
     add_executable(semantic_test_node
         apps/semantic_test_node.cpp
@@ -353,7 +303,6 @@ if(USE_TENSORRT_YOLO AND ONNXRUNTIME_LIBRARY)
         src/s_graphs/common/clip_feature_extractor.cpp
     )
     
-    target_compile_definitions(semantic_test_node PRIVATE USE_TENSORRT_YOLO)
     target_include_directories(semantic_test_node PRIVATE
         ${TENSORRT_INCLUDE_DIR}
         ${CUDA_INCLUDE_DIRS}
@@ -380,38 +329,10 @@ if(USE_TENSORRT_YOLO AND ONNXRUNTIME_LIBRARY)
     install(TARGETS semantic_test_node
         DESTINATION lib/${PROJECT_NAME}
     )
-elseif(ONNXRUNTIME_LIBRARY)
-    message(STATUS "Building semantic_test_node (ONNXRuntime CPU-only)")
-    
-    add_executable(semantic_test_node
-        apps/semantic_test_node.cpp
-        src/s_graphs/common/yolo_onnx_detector.cpp
-        src/s_graphs/common/clip_feature_extractor.cpp
-    )
-    
-    target_include_directories(semantic_test_node PRIVATE
-        ${ONNXRUNTIME_INCLUDE_DIR}
-        ${OpenCV_INCLUDE_DIRS}
-    )
-    
-    ament_target_dependencies(semantic_test_node
-        rclcpp
-        sensor_msgs
-        visualization_msgs
-        cv_bridge
-        image_transport
-    )
-    
-    target_link_libraries(semantic_test_node
-        ${ONNXRUNTIME_LIBRARY}
-        ${OpenCV_LIBRARIES}
-    )
-    
-    install(TARGETS semantic_test_node
-        DESTINATION lib/${PROJECT_NAME}
-    )
 else()
-    message(WARNING "semantic_test_node will NOT be built — no inference backend found")
+    message(WARNING "semantic_test_node will NOT be built - TensorRT or ONNXRuntime not found")
+    message(WARNING "  TENSORRT_LIBRARY: ${TENSORRT_LIBRARY}")
+    message(WARNING "  ONNXRUNTIME_LIBRARY: ${ONNXRUNTIME_LIBRARY}")
 endif()
 
 #############

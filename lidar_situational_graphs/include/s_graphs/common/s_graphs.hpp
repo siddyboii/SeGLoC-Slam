@@ -67,12 +67,11 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #include <s_graphs/common/ros_time_hash.hpp>
 #include <s_graphs/common/ros_utils.hpp>
 #include <s_graphs/common/walls.hpp>
-#ifdef USE_TENSORRT_YOLO
 #include <s_graphs/common/yolo_object_detector.hpp>
-#else
-#include <s_graphs/common/yolo_onnx_detector.hpp>
-#endif
 #include <s_graphs/common/clip_feature_extractor.hpp>
+#include <s_graphs/common/scene_descriptor.hpp>
+#include <s_graphs/common/subgraph_dumper.hpp>
+#include <s_graphs/common/gnn_encoder.hpp>
 #include <s_graphs/frontend/keyframe_updater.hpp>
 #include <s_graphs/frontend/loop_detector.hpp>
 #include <s_graphs/frontend/plane_analyzer.hpp>
@@ -811,11 +810,7 @@ class SGraphsNode : public rclcpp::Node {
   int prev_zone_vertex_id = 0;
 
   // Semantic processing members (YOLO + CLIP)
-#ifdef USE_TENSORRT_YOLO
   std::unique_ptr<YOLOWorldTensorRT> yolo_detector_;
-#else
-  std::unique_ptr<YOLOOnnxDetector> yolo_detector_;
-#endif
   std::unique_ptr<ClipFeatureExtractor> clip_extractor_;
   
   // Semantic publishers
@@ -875,6 +870,11 @@ class SGraphsNode : public rclcpp::Node {
 
   std::unordered_set<int> zone_vertex_ids_in_graph_;
   bool graph_rebuilt_since_last_zone_sync_ = false;
+
+    // GNN encoder for loop closure proposals
+  GNNEncoder gnn_encoder_;
+  bool enable_gnn_ = false;
+  double gnn_proposal_thresh_ = 0.5;
 
   // Zone parameters
 //   bool use_zone_prefilter_ = false;

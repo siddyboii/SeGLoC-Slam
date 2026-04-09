@@ -169,6 +169,11 @@ struct KeyFrame {
   boost::optional<float> scene_dynamicity;      // [0, 1]: 0=static, 1=highly dynamic
   boost::optional<int>   num_dynamic_clusters;  // Number of dynamic object clusters
 
+  // Structural scene descriptor for loop closure verification
+  boost::optional<std::vector<float>> scene_descriptor;
+
+  // GNN subgraph embedding for loop closure proposals (128-dim, L2-normalized)
+  boost::optional<std::vector<float>> gnn_embedding;
 
   g2o::VertexSE3* node;  // node instance
 };
