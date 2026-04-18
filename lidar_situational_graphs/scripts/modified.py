@@ -116,6 +116,8 @@ class ZonesClusterNode(Node):
         self.zone_confidence_base = float(self.get_parameter('zone_confidence_base').value)
         self.visualize = bool(self.get_parameter('visualize').value)
         self.marker_ns = str(self.get_parameter('marker_ns').value)
+        self.zone_centroid_update_thresh = 0.25
+        self.zone_confidence_update_thresh = 0.05
 
         # ---- runtime state ----
         self.lock = Lock()
@@ -286,9 +288,9 @@ class ZonesClusterNode(Node):
         self.publish_zones()
         if self.visualize:
             self.publish_markers()
+            self.publish_zone_perimeters()
+            self.publish_zone_keyframe_links()
         
-        self.publish_zone_perimeters()
-        self.publish_zone_keyframe_links()
 
     # ---------------- core: clustering ----------------
     def build_feature_matrix(self):
@@ -416,18 +418,112 @@ class ZonesClusterNode(Node):
 
     
     # ---------------- zone management ----------------
+    # def create_or_update_zone(self, kf_ids, centroid_xy, sem_sig, top_label, top_conf, conf):
+    #     """Create a new zone or merge into an existing one when close + semantically similar."""
+    #     # search for mergeable zone
+    #     print("Creating or updating zone")
+    #     merged_zone_id = None
+    #     print("Printing Zones")
+    #     print(self.zones.items())
+    #     for zid, z in self.zones.items():
+    #         zx, zy = z['centroid']
+    #         d = math.hypot(zx - centroid_xy[0], zy - centroid_xy[1])
+    #         sem_sim = cosine_similarity(z['sem_sig'], sem_sig) if (z['sem_sig'].size>0 and sem_sig.size>0) else 0.0
+    #         print("Printing Semantic ka samaaan", sem_sim, sem_sig)
+    #         if d <= self.merge_dist_m and sem_sim >= self.merge_semantic_thresh:
+    #             merged_zone_id = zid
+    #             break
+
+    #     if merged_zone_id is None:
+    #         # create new zone
+    #         zid = self.next_zone_id
+    #         self.next_zone_id += 1
+    #         zone = {
+    #             'id': zid,
+    #             'members': set(kf_ids),
+    #             'centroid': (float(centroid_xy[0]), float(centroid_xy[1])),
+    #             'sem_sig': sem_sig.copy() if hasattr(sem_sig, 'copy') else np.array(sem_sig),
+    #             'top_label': top_label,
+    #             'top_conf': float(top_conf),
+    #             'confidence': float(conf),
+    #             'state': 'confirmed',
+    #             'last_updated': time.time(),
+    #             'version': 1
+    #         }
+    #         self.zones[zid] = zone
+    #         self.get_logger().info(f"Created zone {zid} center=({zone['centroid'][0]:.2f},{zone['centroid'][1]:.2f}) size={len(kf_ids)} label={top_label} conf={conf:.2f}")
+    #     else:
+    #         # merge into existing zone
+    #         z = self.zones[merged_zone_id]
+    #         old_members = set(z['members'])
+    #         z['members'].update(kf_ids)
+    #         # recompute centroid as mean of positions of members currently in buffer if available
+    #         with self.lock:
+    #             member_positions = []
+    #             for entry in self.buffer:
+    #                 if entry['id'] in z['members']:
+    #                     member_positions.append((entry['x'], entry['y']))
+    #         if len(member_positions) > 0:
+    #             xs = [p[0] for p in member_positions]
+    #             ys = [p[1] for p in member_positions]
+    #             print(xs,ys)
+    #             z['centroid'] = (float(np.mean(xs)), float(np.mean(ys)))
+    #         # merge semantic signature by weighted average (old sig + new sig)
+    #         try:
+    #             z_old_sig = z['sem_sig']
+    #             if z_old_sig.size == 0:
+    #                 z['sem_sig'] = sem_sig.copy()
+    #             else:
+    #                 z['sem_sig'] = normalize_vec( (z_old_sig + sem_sig) / 2.0 )
+    #         except Exception:
+    #             z['sem_sig'] = sem_sig.copy()
+
+    #         z['top_label'] = top_label if top_conf >= z.get('top_conf', 0.0) else z.get('top_label', top_label)
+    #         z['top_conf'] = max(top_conf, z.get('top_conf', top_conf))
+    #         z['confidence'] = min(1.0, 0.9 * z.get('confidence', 0.5) + 0.1 * conf)
+    #         z['last_updated'] = time.time()
+    #         z['version'] += 1
+    #         self.get_logger().info(f"Merged into zone {merged_zone_id} => new size={len(z['members'])} centroid=({z['centroid'][0]:.2f},{z['centroid'][1]:.2f})")
+    def pad_vec_to_len(self, vec, length):
+        vec = np.asarray(vec, dtype=float).ravel()
+        if len(vec) == length:
+            return vec.copy()
+        out = np.zeros(length, dtype=float)
+        out[:min(len(vec), length)] = vec[:min(len(vec), length)]
+        return out
+    
     def create_or_update_zone(self, kf_ids, centroid_xy, sem_sig, top_label, top_conf, conf):
-        """Create a new zone or merge into an existing one when close + semantically similar."""
-        # search for mergeable zone
+        """
+        Create a new zone or merge into an existing one when close + semantically similar.
+        Version is incremented only when the zone content actually changes.
+        """
         print("Creating or updating zone")
+        now = time.time()
+
+        # make sure inputs are numpy arrays
+        if not isinstance(sem_sig, np.ndarray):
+            sem_sig = np.array(sem_sig, dtype=float)
+
         merged_zone_id = None
+        merged_zone_changed = False
+
         print("Printing Zones")
         print(self.zones.items())
+
         for zid, z in self.zones.items():
             zx, zy = z['centroid']
             d = math.hypot(zx - centroid_xy[0], zy - centroid_xy[1])
-            sem_sim = cosine_similarity(z['sem_sig'], sem_sig) if (z['sem_sig'].size>0 and sem_sig.size>0) else 0.0
+
+            z_sig = z['sem_sig']
+            if not isinstance(z_sig, np.ndarray):
+                z_sig = np.array(z_sig, dtype=float)
+
+            target_len = max(len(z_sig), len(sem_sig))
+            z_sig_padded = self.pad_vec_to_len(z_sig, target_len)
+            sem_sig_padded = self.pad_vec_to_len(sem_sig, target_len)
+            sem_sim = cosine_similarity(z_sig_padded, sem_sig_padded) if (z_sig.size > 0 and sem_sig.size > 0) else 0.0
             print("Printing Semantic ka samaaan", sem_sim, sem_sig)
+
             if d <= self.merge_dist_m and sem_sim >= self.merge_semantic_thresh:
                 merged_zone_id = zid
                 break
@@ -436,52 +532,116 @@ class ZonesClusterNode(Node):
             # create new zone
             zid = self.next_zone_id
             self.next_zone_id += 1
+
             zone = {
                 'id': zid,
                 'members': set(kf_ids),
                 'centroid': (float(centroid_xy[0]), float(centroid_xy[1])),
-                'sem_sig': sem_sig.copy() if hasattr(sem_sig, 'copy') else np.array(sem_sig),
+                'sem_sig': sem_sig.copy(),
                 'top_label': top_label,
                 'top_conf': float(top_conf),
                 'confidence': float(conf),
                 'state': 'confirmed',
-                'last_updated': time.time(),
-                'version': 1
+                'last_updated': now,
+                'version': 1,
+                'dirty': True,
+                'last_published_version': 0,
+                'action': 0,  # CREATE
             }
             self.zones[zid] = zone
-            self.get_logger().info(f"Created zone {zid} center=({zone['centroid'][0]:.2f},{zone['centroid'][1]:.2f}) size={len(kf_ids)} label={top_label} conf={conf:.2f}")
-        else:
-            # merge into existing zone
-            z = self.zones[merged_zone_id]
-            old_members = set(z['members'])
-            z['members'].update(kf_ids)
-            # recompute centroid as mean of positions of members currently in buffer if available
-            with self.lock:
-                member_positions = []
-                for entry in self.buffer:
-                    if entry['id'] in z['members']:
-                        member_positions.append((entry['x'], entry['y']))
-            if len(member_positions) > 0:
-                xs = [p[0] for p in member_positions]
-                ys = [p[1] for p in member_positions]
-                print(xs,ys)
-                z['centroid'] = (float(np.mean(xs)), float(np.mean(ys)))
-            # merge semantic signature by weighted average (old sig + new sig)
-            try:
-                z_old_sig = z['sem_sig']
-                if z_old_sig.size == 0:
-                    z['sem_sig'] = sem_sig.copy()
-                else:
-                    z['sem_sig'] = normalize_vec( (z_old_sig + sem_sig) / 2.0 )
-            except Exception:
-                z['sem_sig'] = sem_sig.copy()
 
-            z['top_label'] = top_label if top_conf >= z.get('top_conf', 0.0) else z.get('top_label', top_label)
-            z['top_conf'] = max(top_conf, z.get('top_conf', top_conf))
-            z['confidence'] = min(1.0, 0.9 * z.get('confidence', 0.5) + 0.1 * conf)
-            z['last_updated'] = time.time()
+            self.get_logger().info(
+                f"Created zone {zid} center=({zone['centroid'][0]:.2f},{zone['centroid'][1]:.2f}) "
+                f"size={len(kf_ids)} label={top_label} conf={conf:.2f}"
+            )
+            return zone
+
+        # merge into existing zone
+        z = self.zones[merged_zone_id]
+        old_members = set(z['members'])
+        old_centroid = z['centroid']
+        old_sig = z['sem_sig'].copy() if isinstance(z['sem_sig'], np.ndarray) else np.array(z['sem_sig'], dtype=float)
+        old_top_label = z.get('top_label', '')
+        old_top_conf = float(z.get('top_conf', 0.0))
+        old_conf = float(z.get('confidence', 0.0))
+
+        # update members
+        z['members'].update(kf_ids)
+
+        # recompute centroid from buffered members that belong to this zone
+        with self.lock:
+            member_positions = []
+            for entry in self.buffer:
+                if entry['id'] in z['members']:
+                    member_positions.append((entry['x'], entry['y']))
+
+        if len(member_positions) > 0:
+            xs = [p[0] for p in member_positions]
+            ys = [p[1] for p in member_positions]
+            print(xs, ys)
+            new_centroid = (float(np.mean(xs)), float(np.mean(ys)))
+        else:
+            new_centroid = old_centroid
+
+        # merge semantic signature
+        # if old_sig.size == 0:
+        #     new_sig = sem_sig.copy()
+        # elif sem_sig.size == 0:
+        #     new_sig = old_sig.copy()
+        # else:
+        #     new_sig = normalize_vec((old_sig + sem_sig) / 2.0)
+        # merge semantic signature
+        old_sig = np.asarray(old_sig, dtype=float).ravel()
+        sem_sig = np.asarray(sem_sig, dtype=float).ravel()
+
+        target_len = max(len(old_sig), len(sem_sig))
+        old_sig = self.pad_vec_to_len(old_sig, target_len)
+        sem_sig = self.pad_vec_to_len(sem_sig, target_len)
+
+        if old_sig.size == 0:
+            new_sig = sem_sig.copy()
+        elif sem_sig.size == 0:
+            new_sig = old_sig.copy()
+        else:
+            new_sig = normalize_vec(old_sig + sem_sig)
+
+        # update best label
+        new_top_label = top_label if top_conf >= old_top_conf else old_top_label
+        new_top_conf = max(top_conf, old_top_conf)
+
+        # confidence update
+        new_conf = min(1.0, 0.9 * old_conf + 0.1 * conf)
+
+        # decide whether anything actually changed enough
+        centroid_shift = math.hypot(new_centroid[0] - old_centroid[0], new_centroid[1] - old_centroid[1])
+        members_changed = (z['members'] != old_members)
+        sig_changed = (old_sig.size != new_sig.size) or (old_sig.size > 0 and np.linalg.norm(old_sig - new_sig) > 1e-6)
+        label_changed = (new_top_label != old_top_label)
+        conf_changed = abs(new_conf - old_conf) > self.zone_confidence_update_thresh
+        centroid_changed = centroid_shift > self.zone_centroid_update_thresh
+
+        merged_zone_changed = members_changed or sig_changed or label_changed or conf_changed or centroid_changed
+
+        # apply updates
+        z['centroid'] = new_centroid
+        z['sem_sig'] = new_sig
+        z['top_label'] = new_top_label
+        z['top_conf'] = float(new_top_conf)
+        z['confidence'] = float(new_conf)
+        z['last_updated'] = now
+        z['action'] = 1  # UPDATE
+
+        if merged_zone_changed:
             z['version'] += 1
-            self.get_logger().info(f"Merged into zone {merged_zone_id} => new size={len(z['members'])} centroid=({z['centroid'][0]:.2f},{z['centroid'][1]:.2f})")
+            z['dirty'] = True
+            self.get_logger().info(
+                f"Merged into zone {merged_zone_id} => new size={len(z['members'])} "
+                f"centroid=({z['centroid'][0]:.2f},{z['centroid'][1]:.2f})"
+            )
+        else:
+            z['dirty'] = False
+
+        return z
 
     def convex_hull_2d(self, points):
         """
@@ -686,48 +846,119 @@ class ZonesClusterNode(Node):
             self.zone_links_pub.publish(ma)
 
     # ---------------- publish zones as messages ----------------
+    # def publish_zones(self):
+    #     """Publish ZoneMsg for each confirmed zone."""
+    #     print("Publishing zones")
+    #     now = self.get_clock().now().to_msg()
+    #     for zid, z in list(self.zones.items()):
+    #         try:
+    #             zm = ZoneMsg()
+    #             # put header if exists
+    #             try:
+    #                 zm.header = Header()
+    #                 zm.header.stamp = now
+    #             except Exception:
+    #                 pass
+    #             # set zone id
+    #             if hasattr(zm, 'zone_id'):
+    #                 zm.zone_id = int(zid)
+    #             # keyframe ids
+    #             if hasattr(zm, 'keyframe_ids'):
+    #                 zm.keyframe_ids = list(z['members'])
+    #             else:
+    #                 try:
+    #                     zm.keyframes = list(z['members'])
+    #                 except Exception:
+    #                     pass
+    #             # top_labels / confidences
+    #             if hasattr(zm, 'top_labels'):
+    #                 zm.top_labels = [z.get('top_label', '')]
+    #             if hasattr(zm, 'top_label_confidences'):
+    #                 zm.top_label_confidences = [float(z.get('top_conf', 0.0))]
+    #             if hasattr(zm, 'confidence'):
+    #                 zm.confidence = float(z.get('confidence', 0.0))
+    #             # supporting_planes optional - left empty
+    #             if hasattr(zm, 'version'):
+    #                 zm.version = int(z.get('version', 0))
+    #             # centroid if present
+    #             if hasattr(zm, 'centroid') or hasattr(zm, 'pose'):
+    #                 try:
+    #                     # some Zone.msg may have centroid or Pose; try to set if present
+    #                     if hasattr(zm, 'centroid'):
+    #                         zm.centroid.position.x = float(z['centroid'][0])
+    #                         zm.centroid.position.y = float(z['centroid'][1])
+    #                         zm.centroid.z = 0.0
+    #                     if hasattr(zm, 'pose'):
+    #                         p = PoseStamped()
+    #                         p.header.stamp = now
+    #                         p.header.frame_id = 'map'
+    #                         p.pose.position.x = float(z['centroid'][0])
+    #                         p.pose.position.y = float(z['centroid'][1])
+    #                         p.pose.position.z = 0.0
+    #                         zm.pose = p
+    #                 except Exception:
+    #                     pass
+
+    #             # publish
+    #             self.zone_pub.publish(zm)
+    #         except Exception as e:
+    #             self.get_logger().error(f"Error publishing zone {zid}: {e}")
     def publish_zones(self):
-        """Publish ZoneMsg for each confirmed zone."""
+        """Publish only dirty zones."""
         print("Publishing zones")
+
         now = self.get_clock().now().to_msg()
-        for zid, z in list(self.zones.items()):
+
+        # snapshot dirty zones only
+        with self.lock:
+            dirty_zones = [(zid, z) for zid, z in self.zones.items() if z.get('dirty', False)]
+
+        for zid, z in dirty_zones:
             try:
                 zm = ZoneMsg()
-                # put header if exists
+
+                # header
                 try:
                     zm.header = Header()
                     zm.header.stamp = now
+                    zm.header.frame_id = 'map'
                 except Exception:
                     pass
-                # set zone id
+
+                # zone id
                 if hasattr(zm, 'zone_id'):
                     zm.zone_id = int(zid)
+
                 # keyframe ids
                 if hasattr(zm, 'keyframe_ids'):
-                    zm.keyframe_ids = list(z['members'])
+                    zm.keyframe_ids = list(sorted(z['members']))
                 else:
                     try:
-                        zm.keyframes = list(z['members'])
+                        zm.keyframes = list(sorted(z['members']))
                     except Exception:
                         pass
-                # top_labels / confidences
+
+                # semantic fields
                 if hasattr(zm, 'top_labels'):
                     zm.top_labels = [z.get('top_label', '')]
                 if hasattr(zm, 'top_label_confidences'):
                     zm.top_label_confidences = [float(z.get('top_conf', 0.0))]
                 if hasattr(zm, 'confidence'):
                     zm.confidence = float(z.get('confidence', 0.0))
-                # supporting_planes optional - left empty
+
+                # version
                 if hasattr(zm, 'version'):
                     zm.version = int(z.get('version', 0))
-                # centroid if present
+
+                # centroid
                 if hasattr(zm, 'centroid') or hasattr(zm, 'pose'):
                     try:
-                        # some Zone.msg may have centroid or Pose; try to set if present
                         if hasattr(zm, 'centroid'):
                             zm.centroid.position.x = float(z['centroid'][0])
                             zm.centroid.position.y = float(z['centroid'][1])
-                            zm.centroid.z = 0.0
+                            zm.centroid.position.z = 0.0
+                            zm.centroid.orientation.w = 1.0
+
                         if hasattr(zm, 'pose'):
                             p = PoseStamped()
                             p.header.stamp = now
@@ -735,12 +966,19 @@ class ZonesClusterNode(Node):
                             p.pose.position.x = float(z['centroid'][0])
                             p.pose.position.y = float(z['centroid'][1])
                             p.pose.position.z = 0.0
+                            p.pose.orientation.w = 1.0
                             zm.pose = p
                     except Exception:
                         pass
 
-                # publish
                 self.zone_pub.publish(zm)
+
+                # clear dirty after successful publish
+                with self.lock:
+                    if zid in self.zones:
+                        self.zones[zid]['dirty'] = False
+                        self.zones[zid]['last_published_version'] = z.get('version', 0)
+
             except Exception as e:
                 self.get_logger().error(f"Error publishing zone {zid}: {e}")
 

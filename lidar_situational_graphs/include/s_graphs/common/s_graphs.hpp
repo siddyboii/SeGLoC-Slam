@@ -114,6 +114,46 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 
 namespace s_graphs {
 
+std::string normalize_label(const std::string& s) {
+  std::string out = s;
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
+template <typename T>
+std::unordered_set<T> to_set(const std::vector<T>& v) {
+  return std::unordered_set<T>(v.begin(), v.end());
+}
+
+double jaccard_similarity(const std::unordered_set<std::string>& a,
+                          const std::unordered_set<std::string>& b) {
+  if (a.empty() || b.empty()) return 0.0;
+
+  std::size_t inter = 0;
+  for (const auto& x : a) {
+    if (b.count(x)) ++inter;
+  }
+
+  const std::size_t uni = a.size() + b.size() - inter;
+  if (uni == 0) return 0.0;
+  return static_cast<double>(inter) / static_cast<double>(uni);
+}
+
+double jaccard_similarity_int(const std::unordered_set<int>& a,
+                              const std::unordered_set<int>& b) {
+  if (a.empty() || b.empty()) return 0.0;
+
+  std::size_t inter = 0;
+  for (const auto& x : a) {
+    if (b.count(x)) ++inter;
+  }
+
+  const std::size_t uni = a.size() + b.size() - inter;
+  if (uni == 0) return 0.0;
+  return static_cast<double>(inter) / static_cast<double>(uni);
+}
+
 class SGraphsNode : public rclcpp::Node {
  public:
   SGraphsNode();
@@ -230,7 +270,10 @@ class SGraphsNode : public rclcpp::Node {
   void sync_zone_layer_to_graph();
 
 //   void attach_or_update_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe);
-  void attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,const ZoneRecord& zone_rec);
+//   void attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,const ZoneRecord& zone_rec);
+void attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
+                                     const ZoneRecord& zone_rec,
+                                     g2o::VertexZone* zone_vertex);
 
   void clear_zone_layer_from_graph();
   /**
@@ -875,6 +918,21 @@ class SGraphsNode : public rclcpp::Node {
 
   std::unordered_set<int> zone_vertex_ids_in_graph_;
   bool graph_rebuilt_since_last_zone_sync_ = false;
+  double zone_zone_confidence_threshold_ = 0.55;
+    double zone_zone_neighbor_radius_ = 5.0;
+    double zone_zone_min_affinity_ = 0.55;
+    int min_zone_support_ = 2;
+
+  void sync_zone_zone_relations(
+    const std::vector<ZoneRecord>& active_zones,
+    const std::unordered_map<int, g2o::VertexZone*>& zone_vertices_by_id);
+
+    bool zones_should_connect(const ZoneRecord& a, const ZoneRecord& b) const;
+    double zone_label_similarity(const ZoneRecord& a, const ZoneRecord& b) const;
+    double zone_room_overlap_similarity(const ZoneRecord& a, const ZoneRecord& b) const;
+    double zone_centroid_distance_xy(const ZoneRecord& a, const ZoneRecord& b) const;
+    Eigen::MatrixXd zone_zone_information_matrix(const ZoneRecord& a,
+                                                const ZoneRecord& b) const;
 
   // Zone parameters
 //   bool use_zone_prefilter_ = false;

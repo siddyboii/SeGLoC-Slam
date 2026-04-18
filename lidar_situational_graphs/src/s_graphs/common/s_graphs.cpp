@@ -2244,6 +2244,19 @@ void SGraphsNode::publish_graph(
             if (!kf->object_confidences->empty()) has_semantics = true;
           }
         }
+        // bool has_semantics = false;
+        // {
+        //   std::lock_guard<std::mutex> lk(keyframe_mutex_);
+        //   if (kf->detected_objects && !kf->detected_objects->empty()) {
+        //     has_semantics = true;
+        //   }
+        //   if (kf->clip_embedding && !kf->clip_embedding->empty()) {
+        //     has_semantics = true;
+        //   }
+        //   if (kf->object_confidences && !kf->object_confidences->empty()) {
+        //     has_semantics = true;
+        //   }
+        // }
         if (!has_semantics) continue;
 
         // Build KeyframeSemantic msg
@@ -2308,6 +2321,17 @@ void SGraphsNode::publish_graph(
           kmsg.scene_confidence = sumc / static_cast<float>(kmsg.object_confidence.size());
         } else {
           kmsg.scene_confidence = 0.0f;
+        }
+
+        // CLIP embedding
+        {
+          std::lock_guard<std::mutex> lk(keyframe_mutex_);
+          if (kf->clip_embedding && !kf->clip_embedding->empty()) {
+            kmsg.clip_embedding.reserve(kf->clip_embedding->size());
+            for (const auto &v : *kf->clip_embedding) {
+              kmsg.clip_embedding.push_back(static_cast<float>(v));
+            }
+          }
         }
 
         // model_name (best-effort)
@@ -3808,6 +3832,7 @@ void SGraphsNode::clear_zone_layer_from_graph() {
   }
 
   zone_vertex_ids_in_graph_.clear();
+  compressed_graph->reset_zone_edge_serials();
 }
 /////////////$$$$$$$$$$$$$$$$$$$$$/////////////////////////////
 
@@ -3930,13 +3955,78 @@ void SGraphsNode::clear_zone_layer_from_graph() {
 //               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
 //               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
 // }
+// void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
+//                                                   const ZoneRecord& zone_rec) {
+//   if (!keyframe || !keyframe->node) return;
+
+//   const int kf_id = static_cast<int>(keyframe->id());
+
+//   // Use the keyframe vertex from the CURRENT compressed graph.
+//   auto* kf_vertex = dynamic_cast<g2o::VertexSE3*>(
+//       compressed_graph->graph->vertex(kf_id));
+//   if (!kf_vertex) {
+//     RCLCPP_WARN(this->get_logger(),
+//                 "[S_GRAPHS] Keyframe vertex %d not found in compressed graph",
+//                 kf_id);
+//     return;
+//   }
+
+//   // Use the zone vertex from the CURRENT compressed graph, or create it.
+//   const int zone_vertex_id = 1000000 + zone_rec.zone_id;
+//   auto* zone_vertex = dynamic_cast<g2o::VertexZone*>(
+//       compressed_graph->graph->vertex(zone_vertex_id));
+
+//   if (!zone_vertex) {
+//     zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose,
+//                                                   zone_rec.zone_id);
+//     if (!zone_vertex) {
+//       RCLCPP_ERROR(this->get_logger(),
+//                    "[S_GRAPHS] Failed to create zone vertex for zone=%d",
+//                    zone_rec.zone_id);
+//       return;
+//     }
+//     zone_vertex_ids_in_graph_.insert(zone_vertex_id);
+//     RCLCPP_INFO(this->get_logger(),
+//                 "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+//   } else {
+//     zone_vertex->setEstimate(zone_rec.centroid_pose);
+//   }
+
+//   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
+//   spread = std::max(spread, 0.5);
+
+//   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
+//   Eigen::Isometry3d measurement = kf_vertex->estimate().inverse() * zone_vertex->estimate();
+
+//   auto* edge = compressed_graph->add_zone_keyframe_edge(
+//       kf_vertex,
+//       zone_vertex,
+//       zone_rec.zone_id,
+//       kf_id,
+//       measurement,
+//       information);
+
+//   if (!edge) {
+//     RCLCPP_ERROR(this->get_logger(),
+//                  "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+//                  kf_id, zone_rec.zone_id);
+//     return;
+//   }
+
+//   compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+
+//   RCLCPP_INFO(this->get_logger(),
+//               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
+//               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+// }
+
 void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
-                                                  const ZoneRecord& zone_rec) {
-  if (!keyframe || !keyframe->node) return;
+                                                  const ZoneRecord& zone_rec,
+                                                  g2o::VertexZone* zone_vertex) {
+  if (!keyframe || !keyframe->node || !zone_vertex) return;
 
   const int kf_id = static_cast<int>(keyframe->id());
 
-  // Use the keyframe vertex from the CURRENT compressed graph.
   auto* kf_vertex = dynamic_cast<g2o::VertexSE3*>(
       compressed_graph->graph->vertex(kf_id));
   if (!kf_vertex) {
@@ -3946,32 +4036,13 @@ void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
     return;
   }
 
-  // Use the zone vertex from the CURRENT compressed graph, or create it.
-  const int zone_vertex_id = 1000000 + zone_rec.zone_id;
-  auto* zone_vertex = dynamic_cast<g2o::VertexZone*>(
-      compressed_graph->graph->vertex(zone_vertex_id));
-
-  if (!zone_vertex) {
-    zone_vertex = compressed_graph->add_zone_node(zone_rec.centroid_pose,
-                                                  zone_rec.zone_id);
-    if (!zone_vertex) {
-      RCLCPP_ERROR(this->get_logger(),
-                   "[S_GRAPHS] Failed to create zone vertex for zone=%d",
-                   zone_rec.zone_id);
-      return;
-    }
-    zone_vertex_ids_in_graph_.insert(zone_vertex_id);
-    RCLCPP_INFO(this->get_logger(),
-                "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
-  } else {
-    zone_vertex->setEstimate(zone_rec.centroid_pose);
-  }
+  const Eigen::Isometry3d measurement =
+      kf_vertex->estimate().inverse() * zone_vertex->estimate();
 
   double spread = compute_zone_spread_from_keyframes(zone_rec.keyframe_ids, keyframes);
   spread = std::max(spread, 0.5);
 
   Eigen::MatrixXd information = zone_information_matrix(zone_rec.confidence, spread);
-  Eigen::Isometry3d measurement = kf_vertex->estimate().inverse() * zone_vertex->estimate();
 
   auto* edge = compressed_graph->add_zone_keyframe_edge(
       kf_vertex,
@@ -3983,7 +4054,7 @@ void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
 
   if (!edge) {
     RCLCPP_ERROR(this->get_logger(),
-                 "[S_GRAPHS] Failed to add zone edge for kf=%d zone=%d",
+                 "[S_GRAPHS] Failed to add zone-keyframe edge for kf=%d zone=%d",
                  kf_id, zone_rec.zone_id);
     return;
   }
@@ -3993,6 +4064,55 @@ void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
   RCLCPP_INFO(this->get_logger(),
               "[S_GRAPHS] Attached zone factor: kf=%d -> zone=%d conf=%.3f spread=%.3f",
               kf_id, zone_rec.zone_id, zone_rec.confidence, spread);
+}
+
+void SGraphsNode::sync_zone_zone_relations(
+    const std::vector<ZoneRecord>& active_zones,
+    const std::unordered_map<int, g2o::VertexZone*>& zone_vertices_by_id) {
+  for (std::size_t i = 0; i < active_zones.size(); ++i) {
+    for (std::size_t j = i + 1; j < active_zones.size(); ++j) {
+      const auto& a = active_zones[i];
+      const auto& b = active_zones[j];
+
+      if (!zones_should_connect(a, b)) continue;
+
+      auto it_a = zone_vertices_by_id.find(a.zone_id);
+      auto it_b = zone_vertices_by_id.find(b.zone_id);
+      if (it_a == zone_vertices_by_id.end() || it_b == zone_vertices_by_id.end()) {
+        continue;
+      }
+
+      g2o::VertexZone* v_a = it_a->second;
+      g2o::VertexZone* v_b = it_b->second;
+      if (!v_a || !v_b) continue;
+
+      const Eigen::Isometry3d measurement =
+          v_a->estimate().inverse() * v_b->estimate();
+
+      Eigen::MatrixXd information = zone_zone_information_matrix(a, b);
+
+      auto* edge = compressed_graph->add_zone_zone_edge(
+          v_a,
+          v_b,
+          a.zone_id,
+          b.zone_id,
+          measurement,
+          information);
+
+      if (!edge) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "[S_GRAPHS] Failed to add zone-zone edge zone=%d <-> zone=%d",
+                     a.zone_id, b.zone_id);
+        continue;
+      }
+
+      compressed_graph->add_robust_kernel(edge, "Huber", 1.0);
+
+      RCLCPP_INFO(this->get_logger(),
+                  "[S_GRAPHS] Attached zone-zone factor: zone=%d <-> zone=%d dist=%.3f",
+                  a.zone_id, b.zone_id, zone_centroid_distance_xy(a, b));
+    }
+  }
 }
 
 
@@ -4006,44 +4126,190 @@ void SGraphsNode::attach_zone_factor_for_keyframe(const KeyFrame::Ptr& keyframe,
 //   }
 //   zones_dirty_ = false;
 // }
+// void SGraphsNode::sync_zone_layer_to_graph() {
+//   // Snapshot the semantic zones first.
+//   std::vector<ZoneRecord> active_zones;
+//   {
+//     std::lock_guard<std::mutex> zlock(zone_mutex_);
+
+//     active_zones.reserve(zone_records_.size());
+//     for (const auto& [zone_id, rec] : zone_records_) {
+//       if (!rec.valid) continue;
+//       active_zones.push_back(rec);
+//     }
+//   }
+
+//   // Always rebuild the zone layer cleanly.
+//   clear_zone_layer_from_graph();
+
+//   // Recreate the keyframe-to-zone lookup from semantic records.
+//   {
+//     std::lock_guard<std::mutex> zlock(zone_mutex_);
+//     keyframe_to_zone_.clear();
+//     for (const auto& rec : active_zones) {
+//       for (int kf_id : rec.keyframe_ids) {
+//         keyframe_to_zone_[kf_id] = rec.zone_id;
+//       }
+//     }
+//   }
+
+//   // Rebuild zones using CURRENT graph-owned keyframe vertices only.
+//   for (const auto& zone_rec : active_zones) {
+//     for (int kf_id : zone_rec.keyframe_ids) {
+//       auto kf_it = keyframes.find(kf_id);
+//       if (kf_it == keyframes.end() || !kf_it->second) continue;
+//       attach_zone_factor_for_keyframe(kf_it->second, zone_rec);
+//     }
+//   }
+
+//   zones_dirty_ = false;
+//   graph_rebuilt_since_last_zone_sync_ = false;
+// }
+
 void SGraphsNode::sync_zone_layer_to_graph() {
-  // Snapshot the semantic zones first.
+  // Caller must already hold graph_mutex.
+
+  // Snapshot active zones first.
   std::vector<ZoneRecord> active_zones;
   {
     std::lock_guard<std::mutex> zlock(zone_mutex_);
-
     active_zones.reserve(zone_records_.size());
+
     for (const auto& [zone_id, rec] : zone_records_) {
       if (!rec.valid) continue;
       active_zones.push_back(rec);
     }
   }
 
-  // Always rebuild the zone layer cleanly.
+  // Rebuild zone layer from scratch to avoid stale g2o pointers.
   clear_zone_layer_from_graph();
 
-  // Recreate the keyframe-to-zone lookup from semantic records.
+  // Rebuild semantic keyframe->zone mapping.
   {
     std::lock_guard<std::mutex> zlock(zone_mutex_);
     keyframe_to_zone_.clear();
     for (const auto& rec : active_zones) {
-      for (int kf_id : rec.keyframe_ids) {
+      std::unordered_set<int> unique_members(rec.keyframe_ids.begin(),
+                                             rec.keyframe_ids.end());
+      for (int kf_id : unique_members) {
         keyframe_to_zone_[kf_id] = rec.zone_id;
       }
     }
   }
 
-  // Rebuild zones using CURRENT graph-owned keyframe vertices only.
-  for (const auto& zone_rec : active_zones) {
-    for (int kf_id : zone_rec.keyframe_ids) {
+  // Create all zone vertices first.
+  std::unordered_map<int, g2o::VertexZone*> zone_vertices_by_id;
+  for (const auto& rec : active_zones) {
+    g2o::VertexZone* zone_vertex =
+        compressed_graph->add_zone_node(rec.centroid_pose, rec.zone_id);
+    if (!zone_vertex) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "[S_GRAPHS] Failed to create zone vertex for zone=%d",
+                   rec.zone_id);
+      continue;
+    }
+
+    zone_vertices_by_id[rec.zone_id] = zone_vertex;
+    zone_vertex_ids_in_graph_.insert(zone_vertex->id());
+
+    RCLCPP_INFO(this->get_logger(),
+                "$$$$$$$$$$$$$$$$$$$$$ZONE VERTEX IS ADDED$$$$$$$$$$$$$$$$$$");
+  }
+
+  // Add keyframe-to-zone edges.
+  for (const auto& rec : active_zones) {
+    auto it = zone_vertices_by_id.find(rec.zone_id);
+    if (it == zone_vertices_by_id.end() || !it->second) continue;
+
+    std::unordered_set<int> unique_members(rec.keyframe_ids.begin(),
+                                           rec.keyframe_ids.end());
+    for (int kf_id : unique_members) {
       auto kf_it = keyframes.find(kf_id);
       if (kf_it == keyframes.end() || !kf_it->second) continue;
-      attach_zone_factor_for_keyframe(kf_it->second, zone_rec);
+      attach_zone_factor_for_keyframe(kf_it->second, rec, it->second);
     }
   }
 
+  // Add zone-to-zone edges.
+  sync_zone_zone_relations(active_zones, zone_vertices_by_id);
+
   zones_dirty_ = false;
   graph_rebuilt_since_last_zone_sync_ = false;
+}
+double SGraphsNode::zone_centroid_distance_xy(const ZoneRecord& a,
+                                              const ZoneRecord& b) const {
+  const double dx = a.centroid_pose.translation().x() - b.centroid_pose.translation().x();
+  const double dy = a.centroid_pose.translation().y() - b.centroid_pose.translation().y();
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+double SGraphsNode::zone_label_similarity(const ZoneRecord& a,
+                                          const ZoneRecord& b) const {
+  std::unordered_set<std::string> la;
+  std::unordered_set<std::string> lb;
+
+  for (const auto& s : a.top_labels) la.insert(normalize_label(s));
+  for (const auto& s : b.top_labels) lb.insert(normalize_label(s));
+
+  return jaccard_similarity(la, lb);
+}
+
+double SGraphsNode::zone_room_overlap_similarity(const ZoneRecord& a,
+                                                 const ZoneRecord& b) const {
+  const auto ra = to_set(a.room_ids);
+  const auto rb = to_set(b.room_ids);
+  return jaccard_similarity_int(ra, rb);
+}
+
+bool SGraphsNode::zones_should_connect(const ZoneRecord& a,
+                                       const ZoneRecord& b) const {
+  if (!a.valid || !b.valid) return false;
+  if (a.zone_id == b.zone_id) return false;
+  if (a.floor_id != b.floor_id) return false;
+
+  if (a.confidence < zone_zone_confidence_threshold_ ||
+      b.confidence < zone_zone_confidence_threshold_) {
+    return false;
+  }
+
+  if (static_cast<int>(a.keyframe_ids.size()) < min_zone_support_ ||
+      static_cast<int>(b.keyframe_ids.size()) < min_zone_support_) {
+    return false;
+  }
+
+  const double dist = zone_centroid_distance_xy(a, b);
+  if (dist > zone_zone_neighbor_radius_) return false;
+
+  const double label_sim = zone_label_similarity(a, b);
+  const double room_sim = zone_room_overlap_similarity(a, b);
+  const double conf_score = 0.5 * (a.confidence + b.confidence);
+  const double spatial_score = 1.0 / (1.0 + dist);
+
+  const double affinity =
+      0.40 * spatial_score +
+      0.30 * conf_score +
+      0.20 * label_sim +
+      0.10 * room_sim;
+
+  return affinity >= zone_zone_min_affinity_;
+}
+
+Eigen::MatrixXd SGraphsNode::zone_zone_information_matrix(const ZoneRecord& a,
+                                                          const ZoneRecord& b) const {
+  const double dist = zone_centroid_distance_xy(a, b);
+  const double label_sim = zone_label_similarity(a, b);
+  const double room_sim = zone_room_overlap_similarity(a, b);
+  const double conf_score = 0.5 * (a.confidence + b.confidence);
+
+  double weight =
+      0.08 *
+      (0.5 + 0.5 * conf_score) *
+      (1.0 / (1.0 + dist)) *
+      (0.5 + 0.5 * std::max(label_sim, room_sim));
+
+  weight = std::clamp(weight, 0.01, 0.15);
+
+  return Eigen::MatrixXd::Identity(6, 6) * weight;
 }
 
 }  // namespace s_graphs

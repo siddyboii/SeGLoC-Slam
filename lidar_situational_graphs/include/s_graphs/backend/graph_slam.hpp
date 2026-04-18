@@ -73,6 +73,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #include <g2o/vertex_wall.hpp>
 #include "g2o/vertex_zone.hpp"
 #include "g2o/edge_zone_keyframe.hpp"
+#include "g2o/edge_zone_zone.hpp"
 #include <memory>
 
 #include "rclcpp/rclcpp.hpp"
@@ -118,6 +119,7 @@ class VertexDoorWay;
 class VertexDeviation;
 class VertexZone;
 class EdgeZoneKeyframe;
+class EdgeZoneZone;
 }  // namespace g2o
 
 namespace s_graphs {
@@ -210,6 +212,15 @@ class GraphSLAM {
   g2o::VertexZone* get_zone_node(const int& zone_id) const;
 
   g2o::EdgeZoneKeyframe* get_zone_edge_by_id(int edge_id);
+
+  g2o::EdgeZoneZone* add_zone_zone_edge(g2o::VertexZone* v_zone_i,
+                                        g2o::VertexZone* v_zone_j,
+                                        int zone_id_i,
+                                        int zone_id_j,
+                                        const Eigen::Isometry3d& measurement,
+                                        const Eigen::MatrixXd& information);
+     
+  void reset_zone_edge_serials();
 
   int make_zone_edge_id(int zone_id, int keyframe_id) const;
   /**
@@ -1036,11 +1047,14 @@ class GraphSLAM {
  private:
   static constexpr int ZONE_VERTEX_ID_BASE = 1000000;
   static constexpr int ZONE_EDGE_ID_BASE   = 2000000;
+  static constexpr int ZONE_ZONE_EDGE_ID_BASE = 1500000000;
 
-  int zone_edge_serial_ = 2000000; // 0
+  int zone_edge_serial_ = 0; // 0
+  int zone_zone_edge_serial_ = 0;
 
   int next_zone_edge_id();
   bool zone_edge_id_exists(int candidate) const ;
+  int next_zone_zone_edge_id();
 };
 
 }  // namespace s_graphs

@@ -173,13 +173,23 @@ bool GraphSLAM::zone_edge_id_exists(int candidate) const {
 // Change this to use a simple class member counter
 int GraphSLAM::next_zone_edge_id() {
     // Initialize zone_edge_serial_ to a high number in your constructor (e.g., 2000000)
-    return zone_edge_serial_++; 
+    return ZONE_EDGE_ID_BASE + zone_edge_serial_++; 
+}
+
+int GraphSLAM::next_zone_zone_edge_id() {
+  return ZONE_ZONE_EDGE_ID_BASE + zone_zone_edge_serial_++;
 }
 
 int GraphSLAM::make_zone_edge_id(int zone_id, int keyframe_id) const {
   // Stable pair-based id. Keep it far from the normal graph ids.
   return 100000000 + zone_id * 100000 + keyframe_id;
 }
+
+void GraphSLAM::reset_zone_edge_serials() {
+  zone_edge_serial_ = 0;
+  zone_zone_edge_serial_ = 0;
+}
+
 
 g2o::EdgeZoneKeyframe* GraphSLAM::get_zone_edge_by_id(int edge_id) {
   if (graph->edges().empty()) return nullptr;
@@ -304,6 +314,33 @@ g2o::EdgeZoneKeyframe* GraphSLAM::add_zone_keyframe_edge(
 
   return edge;
 }
+g2o::EdgeZoneZone* GraphSLAM::add_zone_zone_edge(
+    g2o::VertexZone* v_zone_i,
+    g2o::VertexZone* v_zone_j,
+    int zone_id_i,
+    int zone_id_j,
+    const Eigen::Isometry3d& measurement,
+    const Eigen::MatrixXd& information) {
+  (void)zone_id_i;
+  (void)zone_id_j;
+
+  if (!v_zone_i || !v_zone_j) return nullptr;
+
+  g2o::EdgeZoneZone* edge(new g2o::EdgeZoneZone());
+  edge->setId(next_zone_zone_edge_id());
+  edge->setVertex(0, v_zone_i);
+  edge->setVertex(1, v_zone_j);
+  edge->setMeasurement(measurement);
+  edge->setInformation(information);
+
+  if (!graph->addEdge(edge)) {
+    delete edge;
+    return nullptr;
+  }
+
+  return edge;
+}
+
 // g2o::EdgeFloorRoom* GraphSLAM::add_floor_zone_edge(g2o::VertexFloor* v_floor,
 //                                                    g2o::VertexZone* v_zone,
 //                                                    const Eigen::Vector3d& measurement,
